@@ -51,6 +51,32 @@ const TTS_AUDIO_HOSTS = (process.env.TTS_AUDIO_HOSTS ||
   'dashscope-result-bj.oss-cn-beijing.aliyuncs.com,dashscope-result-cn-beijing.oss-cn-beijing.aliyuncs.com,nls-cloud-cn-beijing.oss-cn-beijing.aliyuncs.com')
   .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
 
+// ---------- 合成音频缓存（P1：重复文本/短句近零延迟）----------
+// 合成按字符计费且每次有固定开销，短句与高频问答重复合成很浪费。
+// 用内存 LRU + TTL 缓存合成结果：只存音频 Buffer，不落盘（进程重启即清空，避免隐私内容留存）。
+const TTS_CACHE_MAX = Number(process.env.TTS_CACHE_MAX || 200)          // 最多缓存条数
+const TTS_CACHE_TTL = Number(process.env.TTS_CACHE_TTL_MS || 30 * 60 * 1000) // 30 分钟
+const ttsCache = new Map() // key -> { buf: Buffer, ts: number }；Map 插入顺序即 LRU 顺序（末尾最新）
+
+function ttsCacheGet(key) {
+  const hit = ttsCache.get(key)
+  if (!hit) return null
+  if (Date.now() - hit.ts > TTS_CACHE_TTL) { ttsCache.delete(key); return null }
+  ttsCache.delete(key); ttsCache.set(key, hit) // 命中移到末尾 = 最近使用
+  return hit.buf
+}
+function ttsCacheSet(key, buf) {
+  if (TTS_CACHE_MAX <= 0) return
+  ttsCache.delete(key)
+  ttsCache.set(key, { buf, ts: Date.now() })
+  while (ttsCache.size > TTS_CACHE_MAX) {
+    const oldest = ttsCache.keys().next().value
+    ttsCache.delete(oldest)
+  }
+}
+// single-flight：同一 key 的并发合成合并为一次上游请求，避免重复计费与重复等待
+const ttsInflight = new Map() // key -> Promise<Buffer>
+
 // ---------- 工具函数 ----------
 function maskKey(key) {
   if (!key) return ''
@@ -377,6 +403,54 @@ async function handleTtsStatus(req, res) {
   }
 }
 
+// 真正执行一次上游合成 → 返回音频 Buffer；失败抛 { status, error }。
+// 被 handleTtsSynthesize 通过 single-flight 复用，避免同 key 并发重复请求。
+async function doTtsSynthesis(text, voice, model, key) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 120000)
+  let stage = 'synth-request'
+  try {
+    const r = await fetch(TTS_SYNTH_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model, input: { text, voice, format: 'mp3', sample_rate: 24000 } }),
+      signal: controller.signal,
+    })
+    stage = 'audio-download'
+    const textResp = await r.text()
+    if (!r.ok) {
+      let detail = textResp
+      try { detail = JSON.parse(textResp)?.message || textResp } catch { /* ignore */ }
+      throw { status: r.status === 401 ? 401 : 502, error: `语音合成失败：${detail}`.slice(0, 300) }
+    }
+    let json
+    try { json = JSON.parse(textResp) } catch { throw { status: 502, error: '合成响应解析失败' } }
+    const audioUrl = json?.output?.audio?.url
+    if (!audioUrl) throw { status: 502, error: '合成响应未包含音频地址' }
+    // SSRF 防护：只允许白名单 OSS 域名；平台返回的是 http:// 内网回源域名，属正常现象。
+    try {
+      const u = new URL(audioUrl)
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('协议非法')
+      if (!TTS_AUDIO_HOSTS.includes(u.hostname.toLowerCase())) throw new Error(u.hostname)
+    } catch {
+      throw { status: 502, error: '音频下载地址不在安全白名单内，已拦截' }
+    }
+    stage = 'audio-fetch'
+    const ar = await fetch(audioUrl, { signal: controller.signal })
+    if (!ar.ok) throw { status: 502, error: `音频下载失败（${ar.status}）` }
+    stage = 'audio-read'
+    const abuf = Buffer.from(await ar.arrayBuffer())
+    if (abuf.length < 32) throw { status: 502, error: '下载到的音频为空' }
+    return abuf
+  } catch (e) {
+    if (e && e.status) throw e
+    const msg = e.name === 'AbortError' ? `合成超时(${stage})` : `网络错误(${stage})：${e.message}`
+    throw { status: 502, error: msg }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 // POST /api/tts/synthesize —— 用（克隆）音色合成语音，服务端代理下载音频以二进制返回
 // 请求：{ text, voiceId, model? }  响应：audio/mpeg 二进制；失败为 JSON
 async function handleTtsSynthesize(req, res) {
@@ -390,63 +464,41 @@ async function handleTtsSynthesize(req, res) {
   const voice = String(p.voiceId || '').trim()
   if (!/^[A-Za-z0-9._-]+$/.test(voice)) return sendJSON(res, 400, { ok: false, error: 'voiceId 非法：请先克隆音色或选择系统音色' })
   const model = typeof p.model === 'string' && /^[a-z0-9.-]+$/i.test(p.model) ? p.model : TTS_MODEL
+  const cacheKey = `${model}|${voice}|${text}`
 
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 120000)
-  let stage = 'synth-request'
   try {
-    const r = await fetch(TTS_SYNTH_API, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify({
-        model,
-        input: { text, voice, format: 'mp3', sample_rate: 24000 },
-      }),
-      signal: controller.signal,
-    })
-    stage = 'audio-download'
-    const textResp = await r.text()
-    if (!r.ok) {
-      let detail = textResp
-      try { detail = JSON.parse(textResp)?.message || textResp } catch { /* ignore */ }
-      return sendJSON(res, r.status === 401 ? 401 : 502, { ok: false, error: `语音合成失败：${detail}`.slice(0, 300) })
+    // 1) 缓存命中：直接回传，近零延迟
+    const cached = ttsCacheGet(cacheKey)
+    if (cached) return sendTtsAudio(res, cached, voice, 'HIT')
+
+    // 2) single-flight：同 key 正在合成则复用同一个 Promise
+    let inflight = ttsInflight.get(cacheKey)
+    if (!inflight) {
+      inflight = doTtsSynthesis(text, voice, model, key).then((buf) => {
+        ttsCacheSet(cacheKey, buf)
+        return buf
+      }).finally(() => ttsInflight.delete(cacheKey))
+      ttsInflight.set(cacheKey, inflight)
     }
-    let json
-    try { json = JSON.parse(textResp) } catch { return sendJSON(res, 502, { ok: false, error: '合成响应解析失败' }) }
-    const audioUrl = json?.output?.audio?.url
-    if (!audioUrl) return sendJSON(res, 502, { ok: false, error: '合成响应未包含音频地址' })
-    // SSRF 防护：音频下载域名必须在白名单内。
-    // 注意：平台返回的 OSS 结果域名是 http://（内网回源域名），这是正常现象，
-    // 因此这里只校验 host 白名单，不强制 https —— 域名白名单已足以防 SSRF。
-    let host
-    try {
-      const u = new URL(audioUrl)
-      if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('协议非法')
-      host = u.hostname.toLowerCase()
-      if (!TTS_AUDIO_HOSTS.includes(host)) throw new Error(host)
-    } catch {
-      return sendJSON(res, 502, { ok: false, error: '音频下载地址不在安全白名单内，已拦截' })
-    }
-    stage = 'audio-fetch'
-    const ar = await fetch(audioUrl, { signal: controller.signal })
-    if (!ar.ok) return sendJSON(res, 502, { ok: false, error: `音频下载失败（${ar.status}）` })
-    stage = 'audio-read'
-    const abuf = Buffer.from(await ar.arrayBuffer())
-    if (abuf.length < 32) return sendJSON(res, 502, { ok: false, error: '下载到的音频为空' })
-    res.writeHead(200, {
-      'Content-Type': 'audio/mpeg',
-      'Content-Length': abuf.length,
-      'Cache-Control': 'no-store',
-      'X-TTS-Voice': voice,
-    })
-    res.end(abuf)
+    const buf = await inflight
+    return sendTtsAudio(res, buf, voice, 'MISS')
   } catch (e) {
-    const msg = e.name === 'AbortError' ? `合成超时(${stage})` : `网络错误(${stage})：${e.message}`
-    if (!res.headersSent) sendJSON(res, 502, { ok: false, error: msg })
+    const status = e && e.status ? e.status : 502
+    const error = e && e.error ? e.error : ('合成失败：' + (e?.message || '未知错误'))
+    if (!res.headersSent) sendJSON(res, status, { ok: false, error })
     else if (!res.writableEnded) res.end()
-  } finally {
-    clearTimeout(timer)
   }
+}
+
+function sendTtsAudio(res, buf, voice, cacheState) {
+  res.writeHead(200, {
+    'Content-Type': 'audio/mpeg',
+    'Content-Length': buf.length,
+    'Cache-Control': 'no-store',
+    'X-TTS-Voice': voice,
+    'X-TTS-Cache': cacheState,
+  })
+  return res.end(buf)
 }
 
 // ---------- 服务 ----------

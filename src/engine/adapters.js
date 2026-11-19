@@ -251,6 +251,148 @@ function pickSystemVoice(rawVoices, gender) {
   })[0] || null
 }
 
+// ---------- 克隆音色的句子级流水线播放（P0：降低首字延迟）----------
+// 背景：云端合成耗时近似线性于文本长度（实测约 0.1s/字 + 1.3s 固定开销）。
+// 整段 200 字要等 ~20s 才开口。这里把回复切成句子：首句即可合成播放，
+// 播放当前句的同时后台预合成下一句，从而把「首字延迟」降到首句的合成时间。
+const SENTENCE_MIN = 8   // 太短的片段不单独合成（固定开销不划算），并入相邻句
+const SENTENCE_MAX = 42  // 太长的句子再按逗号切，避免单句合成过久
+const PREFETCH_MAX = 80  // 客户端预取表上限，防止长会话累积 blob URL
+
+// 把纯文本切成适合逐句合成的句子数组。逐字符扫描，避免依赖 lookbehind 正则的兼容性。
+function splitIntoSentences(text) {
+  const raw = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!raw) return []
+  const STRONG = '。！？!?；;\n'
+  const WEAK = '，,、'
+  const segs = []
+  let cur = ''
+  for (const ch of raw) {
+    cur += ch
+    if (STRONG.includes(ch)) { segs.push(cur); cur = '' }
+  }
+  if (cur.trim()) segs.push(cur)
+
+  const out = []
+  let buf = ''
+  const flush = (force) => { if (buf && (force || buf.length >= SENTENCE_MIN)) { out.push(buf); buf = '' } }
+  for (const seg of segs) {
+    if (seg.length > SENTENCE_MAX) {
+      flush(true)
+      let sub = ''
+      for (const ch of seg) {
+        sub += ch
+        if (sub.length >= SENTENCE_MIN && (WEAK.includes(ch) || sub.length >= SENTENCE_MAX)) { out.push(sub); sub = '' }
+      }
+      if (sub.trim()) out.push(sub)
+    } else if ((buf + seg).length > SENTENCE_MAX && buf) {
+      flush(true); buf = seg; flush(false)
+    } else {
+      buf += seg; flush(false)
+    }
+  }
+  if (buf.trim()) {
+    if (out.length && (out[out.length - 1] + buf).length <= SENTENCE_MAX) out[out.length - 1] += buf
+    else out.push(buf)
+  }
+  return out.length ? out : [raw]
+}
+
+// 播放运行时：seq 用于打断旧队列；urls 统一回收；prefetch 做客户端去重（同轮内）
+const speechRuntime = {
+  seq: 0,
+  audio: null,
+  urls: new Set(),
+  prefetch: new Map(),
+}
+
+function cleanupSpeechUrls() {
+  for (const u of speechRuntime.urls) { try { URL.revokeObjectURL(u) } catch { /* ignore */ } }
+  speechRuntime.urls.clear()
+  speechRuntime.prefetch.clear()
+}
+
+// 合成单句 → blob URL；同轮内相同句子复用，避免重复请求
+function synthOne(text, voiceId) {
+  const key = `${voiceId}|${text}`
+  if (speechRuntime.prefetch.has(key)) return speechRuntime.prefetch.get(key)
+  const p = (async () => {
+    try {
+      const res = await fetch('/api/tts/synthesize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voiceId }),
+      })
+      if (!res.ok) return null
+      const blob = await res.blob()
+      if (blob.size < 32) return null
+      const url = URL.createObjectURL(blob)
+      speechRuntime.urls.add(url)
+      return url
+    } catch { return null }
+  })()
+  speechRuntime.prefetch.set(key, p)
+  if (speechRuntime.prefetch.size > PREFETCH_MAX) {
+    const oldest = speechRuntime.prefetch.keys().next().value
+    speechRuntime.prefetch.delete(oldest)
+  }
+  return p
+}
+
+function playAudioUrl(url) {
+  return new Promise((resolve) => {
+    if (typeof Audio === 'undefined') return resolve(false)
+    const a = new Audio(url)
+    speechRuntime.audio = a
+    let settled = false
+    const done = (v) => {
+      if (settled) return
+      settled = true
+      if (speechRuntime.audio === a) speechRuntime.audio = null
+      resolve(v)
+    }
+    a.onended = () => done(true)
+    a.onerror = () => done(false)
+    try { const pr = a.play(); if (pr && typeof pr.catch === 'function') pr.catch(() => done(false)) }
+    catch { done(false) }
+  })
+}
+
+// 停止当前克隆播报（新一轮消息/切换音色时调用）。递增 seq 让旧队列在下一次检查时退出。
+export function stopClonedSpeech() {
+  speechRuntime.seq += 1
+  const a = speechRuntime.audio
+  if (a) { try { a.pause() } catch { /* ignore */ } speechRuntime.audio = null }
+  cleanupSpeechUrls()
+}
+
+// 句子级流水线播报：首句先合成即播，播放中预取下一句；返回是否至少成功起播一句。
+async function playClonedSequence(text, resource, callbacks = {}) {
+  const mySeq = ++speechRuntime.seq
+  cleanupSpeechUrls() // 清掉上一轮遗留的 URL（seq 已递增，不会被旧队列复用）
+  const voiceId = resource?.realVoiceId || resource?.voiceId
+  if (!voiceId) { callbacks.onError?.('音色缺少 voiceId'); return false }
+  const sentences = splitIntoSentences(text)
+  if (!sentences.length) return false
+
+  let next = synthOne(sentences[0], voiceId) // 首句立即开始合成
+  let started = false
+  for (let i = 0; i < sentences.length; i++) {
+    if (mySeq !== speechRuntime.seq) return started // 被新一轮打断
+    const url = await next
+    if (mySeq !== speechRuntime.seq) return started
+    // 播放当前句的同时，后台预合成下一句（并行 = 流水线）
+    next = i + 1 < sentences.length ? synthOne(sentences[i + 1], voiceId) : Promise.resolve(null)
+    if (!url) { continue } // 某句合成失败则跳过，不中断整轮
+    const played = await playAudioUrl(url)
+    if (mySeq !== speechRuntime.seq) return started
+    if (played) started = true
+  }
+  cleanupSpeechUrls()
+  callbacks.onDone?.()
+  return started
+}
+
 export const voiceAdapter = {
   /**
    * 读取系统可用语音列表（中文优先）。
@@ -323,9 +465,10 @@ export const voiceAdapter = {
   },
 
   speak(text, resource) {
-    // 真克隆音色：异步走云端合成播放。调用方若需要知道结果，可改用 speakAsync()。
+    // 真克隆音色：走句子级流水线（首句即播 + 预取下一句），显著降低首字延迟。
+    // 这是对整段 speakCloned 的替代；试听单句仍直接用 speakCloned。
     if (resource && resource.ttsMode === 'cloned' && resource.realVoiceId) {
-      this.speakCloned(text, resource)
+      playClonedSequence(text, resource)
       return true
     }
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return false

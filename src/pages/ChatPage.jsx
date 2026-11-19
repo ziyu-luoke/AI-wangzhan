@@ -3,6 +3,7 @@ import { store } from '../store/store.js'
 import { useStoreState } from '../store/useStore.js'
 import { useUI } from '../components/UIContext.jsx'
 import { resolveActiveConfig, streamReply, consumeSafePoint, playTTS } from '../engine/chatEngine.js'
+import { stopClonedSpeech } from '../engine/adapters.js'
 import { stripMeta } from '../engine/textClean.js'
 
 const QUICK = ['今天天气真好呀！', '给我讲个冷笑话', '你是谁呀？', '周末去哪玩？']
@@ -31,6 +32,8 @@ export default function ChatPage() {
     if (!msg || busy) return
     setInput(''); setBusy(true); setStreaming('')
     setBotMood('thinking'); setMascot('thinking', '让我想想…', 0)
+    // 新一轮开始：打断上一轮尚未播完的克隆语音，避免两段声音叠加
+    stopClonedSpeech()
 
     store.appendMessage(session.sessionId, 'user', msg)
 
