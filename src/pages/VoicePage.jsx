@@ -88,6 +88,9 @@ export default function VoicePage() {
   const [progress, setProgress] = useState(0)
   const [progressLabel, setProgressLabel] = useState('')
   const [replaceId, setReplaceId] = useState('')   // 非空表示「替换已有音色」
+  // 音色方向：DSP 仅凭基频无法区分童声男孩/成年女声，允许用户按素材听感纠正选嗓方向。
+  // '' = 沿用自动推断；male/female/neutral = 用户显式覆盖
+  const [genderChoice, setGenderChoice] = useState('')
   const fileRef = useRef(null)
   const audioRef = useRef(null)
   const sampleUrlRef = useRef('')
@@ -149,7 +152,7 @@ export default function VoicePage() {
   const openClone = () => {
     setGenOpen(true); setStep(0); setFile(null); setMaterial(null)
     setSampleError(''); setAuthorized(false); setCandidates([]); setSelected(null)
-    setProgress(0); setProgressLabel(''); setReplaceId('')
+    setProgress(0); setProgressLabel(''); setReplaceId(''); setGenderChoice('')
     setForm(emptyForm()); setMascot('thinking', '上传一段声音样本吧～')
   }
 
@@ -186,6 +189,12 @@ export default function VoicePage() {
       setMascot('error', '样本质量不够哦～')
       return
     }
+    // 用真实特征算一个自动推断方向，仅作为选择器的默认值提示（用户可改）。
+    // 童声男孩 f0 可能 >205Hz 被误判为女声，所以这里只做「建议」，最终方向交给用户确认。
+    try {
+      const inferred = deriveParams(info.features).gender
+      setGenderChoice(['male', 'female', 'neutral'].includes(inferred) ? inferred : '')
+    } catch { setGenderChoice('') }
     toast('样本校验通过', 'success'); setMascot('wink', '样本不错哦！')
   }
 
@@ -207,6 +216,8 @@ export default function VoicePage() {
       const result = await voiceAdapter.clone(file, {
         name: form.name || '克隆音色',
         count: 3,
+        // 用户按素材听感指定的音色方向（'' 表示沿用自动推断）
+        genderOverride: genderChoice || undefined,
         // seed 固定 → 同一素材每次得到同一 voiceId，不同素材必然不同
         onProgress: (pct, label) => { setProgress(pct); setProgressLabel(label) },
       })
@@ -221,11 +232,18 @@ export default function VoicePage() {
     }
   }
 
-  // 步骤3：试听候选 —— 必须用该候选自己的 params
-  const previewCandidate = (c) => {
+  // 步骤3：试听候选 —— 真克隆音色走云端合成本人声音，本地降级则用系统语音+参数
+  const previewCandidate = async (c) => {
     setSelected(c)
+    if (c.ttsMode === 'cloned' && c.realVoiceId) {
+      toast('正在用你的声音合成试听…', 'info')
+      const ok = await voiceAdapter.speakCloned(SAMPLE_SENTENCE, c)
+      if (!ok) toast('云端音色试听失败，请检查网络或稍后重试；对话时将自动降级为系统语音', 'warn')
+      return
+    }
     const spoken = voiceAdapter.speak(SAMPLE_SENTENCE, { ...c, params: c.params })
-    toast(spoken ? `试听候选：${c.name}` : '当前浏览器不支持语音合成', 'info')
+    const reason = c.degradeReason ? `（本地模式：${c.degradeReason}）` : ''
+    toast(spoken ? `试听候选：${c.name}${reason}` : '当前浏览器不支持语音合成', 'info')
   }
 
   // 步骤3：采纳（新建 或 替换已有音色）
@@ -241,6 +259,9 @@ export default function VoicePage() {
       source: '声音克隆',
       sourceType: 'clone',
       voiceId: selected.voiceId,
+      // 真克隆音色标记：realVoiceId/ttsMode 决定对话播放走云端合成还是本地系统语音
+      realVoiceId: selected.realVoiceId || '',
+      ttsMode: selected.ttsMode || 'local',
       params: { ...selected.params },
       features: selected.features,
       gender: selected.params.gender || 'neutral',
@@ -263,14 +284,37 @@ export default function VoicePage() {
         store.updateResource('voice', replaceId, { ...base, enabled: cur.enabled }, cur.version)
         // 旧样本键不同则清理，避免样本库残留
         if (cur.sampleKey && cur.sampleKey !== sampleKey) await store.deleteVoiceSample(cur.sampleKey)
-        toast(`音色「${name}」已替换，资源 ID 保持不变，需重新发布后生效`, 'success')
       } else {
         store.createResource('voice', { ...base, id: resourceId })
-        toast(`音色「${name}」已采纳并创建`, 'success')
       }
       // 样本落盘：原声留存，支持后续原声试听与替换
       const saved = await store.saveVoiceSample(sampleKey, file)
-      setMascot('love', '采用啦！')
+
+      // === 关键：让克隆音色真正进入对话播放链路 ===
+      // 采纳一个音色，用户的意图就是立即用它说话。若只 createResource 而不绑定，
+      // resolveActiveConfig() 会继续读旧的 publishedBinding —— 这正是
+      // 「采纳了新音色，对话却仍是系统固定音色」的根因。
+      // 因此采纳后：① 设为草稿绑定 ② 自动发布，使其进入生效配置。
+      // 发布沿用项目既有的版本/安全点机制，会话上下文不会丢。
+      store.updateDraftBinding({ voiceId: resourceId })
+      let published = false
+      let pubErr = ''
+      try {
+        store.publish()
+        published = true
+      } catch (e) {
+        // 绑定其它资源（模型/形象/人设）校验不通过时不阻断采纳，
+        // 音色仍是草稿绑定，提示用户去发布中心处理后再生效。
+        pubErr = e?.message || '发布校验未通过'
+      }
+      if (published) {
+        toast(`音色「${name}」已采纳、绑定并发布，对话将在当前轮结束后用新音色发声`, 'success')
+        setMascot('love', '新音色已上线！')
+      } else {
+        toast(`音色「${name}」已采纳并设为当前音色，但发布未成功（${pubErr}）；请到发布中心发布后对话才会生效`, 'warn')
+        setMascot('love', '采用啦！')
+      }
+
       const latest = store.getState().generationTasks[0]
       if (latest) store.updateGenerationTask(latest.id, { status: 'ADOPTED' })
       setGenOpen(false)
@@ -441,6 +485,16 @@ export default function VoicePage() {
             <h4>🎛️ 克隆参数</h4>
             <div className="field"><label>音色名称</label><input className="input" value={form.name} onChange={(e) => set('name', e.target.value)} placeholder="如：阳光少年" /></div>
             <div className="field">
+              <label>音色方向（决定试听时选男声/女声嗓子）</label>
+              <select className="select" value={genderChoice} onChange={(e) => setGenderChoice(e.target.value)}>
+                <option value="">自动推断（{({ male: '偏男声', female: '偏女声', neutral: '中性' })[deriveParams(material?.features || {}).gender] || '中性'}）</option>
+                <option value="male">偏男声（童声男孩请选此项）</option>
+                <option value="female">偏女声</option>
+                <option value="neutral">中性</option>
+              </select>
+              <p className="tiny muted mt">仅凭基频无法区分童声男孩与成年女声（都可能 ~258Hz）。若素材是男孩/男声却自动判成女声，请手动选「偏男声」，试听会改用男声嗓子并按素材音调调整。</p>
+            </div>
+            <div className="field">
               <label>替换已有音色（可选）</label>
               <select className="select" value={replaceId} onChange={(e) => setReplaceId(e.target.value)}>
                 <option value="">不替换，克隆为新音色</option>
@@ -465,6 +519,9 @@ export default function VoicePage() {
         {step === 3 && <>
           <p className="tiny muted mb">点击候选试听（使用该候选自身的音高/语速/情感参数），选择最满意的一个采纳。试听句：<b>{SAMPLE_SENTENCE}</b></p>
           {material && <p className="tiny muted mb">素材实测：{featureSummary(material.features)}</p>}
+          <p className="tiny muted mb" style={{ color: 'var(--warn)' }}>
+            说明：试听采用浏览器系统语音引擎，按音色方向选男/女声嗓子并叠加从素材测得的音调与语速参数，属于「参数化模拟」，并非复刻素材本人的声纹。要得到与本人高度一致的音色，需接入后端声纹克隆服务（替换 voiceAdapter.speak/clone 内部实现即可，界面契约不变）。
+          </p>
           <div className="cand-list">
             {candidates.map((c) => (
               <div key={c.id} className={`cand-row ${selected?.id === c.id ? 'selected' : ''}`} onClick={() => previewCandidate(c)}>

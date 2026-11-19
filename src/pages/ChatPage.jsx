@@ -43,7 +43,23 @@ export default function ChatPage() {
     setStreaming('')
     store.appendMessage(session.sessionId, 'assistant', finalText)
     setBotMood('happy'); setMascot('happy', '说完啦！')
-    playTTS(finalText, config)
+
+    // 语音播报：真克隆音色走云端合成（本人声音），本地音色用系统语音 + 派生参数
+    const voiceName = config.voice?.name || '默认音色'
+    if (!config.voice) {
+      toast('未加载生效音色，请到发布中心绑定后再试', 'warn')
+    } else if (config.voice.ttsMode === 'cloned' && config.voice.realVoiceId) {
+      playTTS(finalText, config) // 云端异步合成播放；失败时内部会 console.warn 并降级静默
+      toast(`正在用克隆音色「${voiceName}」播放`, 'info')
+    } else {
+      const speaks = typeof window !== 'undefined' && 'speechSynthesis' in window
+      const played = speaks ? playTTS(finalText, config) : false
+      if (!speaks) {
+        toast('当前浏览器不支持语音合成，回复已正常显示（音色播放不可用）', 'warn')
+      } else if (!played) {
+        toast(`音色「${voiceName}」无正文可播报`, 'info')
+      }
+    }
 
     // === 安全点：TTS 播完的这一刻，消费配置变更 ===
     const t = setTimeout(() => {

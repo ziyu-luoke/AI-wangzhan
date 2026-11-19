@@ -195,12 +195,26 @@ function parabolicPeak(r, lag, minLag, maxLag) {
 /**
  * 基频估计：逐帧自相关 + 中位数汇总。
  * 为什么取中位数而不是均值：个别帧会被清音/噪声污染，中位数对离群帧不敏感。
+ *
+ * 稳健性设计（修复低频边界三类缺陷）：
+ *  1) 分析窗自适应加长：至少覆盖 F0_MIN 的 3 个周期（60Hz 需 ≥50ms），
+ *     原来固定 20ms 窗内只有 1.2 个 60Hz 周期，自相关在低频端天然不可靠；
+ *  2) 搜索区间向两端各放宽 ~15%：让 60Hz / 400Hz 的端点峰落在区间内部，
+ *     可被抛物线插值细化，消除 maxLag=ceil(sr/60) 造成的 60Hz 死区；
+ *  3) 范围守卫只保留 [F0_MIN, F0_MAX] 内的峰——低于 60Hz 的真峰（周期超出
+ *     搜索区间）不再被误报成区间上界的 400Hz 伪峰，而是按契约返回 0；
+ *  4) 谐波一致性校验：候选峰 2 倍 lag 处应同样显著（周期信号特征），滤除
+ *     低频嗡声压制真峰后留下的孤立伪峰。
  */
 function estimateF0(samples, sampleRate) {
-  const frameLen = Math.max(4, Math.round((sampleRate * FRAME_MS) / 1000))
+  // 帧长至少覆盖 3 个最低频周期，保证低频段自相关有足够样本
+  const baseFrame = Math.max(4, Math.round((sampleRate * FRAME_MS) / 1000))
+  const lowFrame = Math.ceil((sampleRate / F0_MIN) * 3)
+  const frameLen = Math.max(baseFrame, lowFrame)
   const hop = Math.max(1, Math.round((sampleRate * HOP_MS) / 1000))
-  const minLag = Math.max(2, Math.floor(sampleRate / F0_MAX))
-  const maxLag = Math.min(Math.ceil(sampleRate / F0_MIN), frameLen - 2)
+  // 搜索区间向两端放宽，端点峰不再贴着边界导致插值出界
+  const minLag = Math.max(2, Math.floor(sampleRate / (F0_MAX * 1.15)))
+  const maxLag = Math.min(Math.ceil(sampleRate / (F0_MIN * 0.85)), frameLen - 3)
   if (samples.length < frameLen || maxLag <= minLag) return 0
 
   const values = []
@@ -220,7 +234,8 @@ function estimateF0(samples, sampleRate) {
     const frame = new Float32Array(frameLen)
     for (let i = 0; i < frameLen; i++) frame[i] = samples[start + i] - mean
 
-    const r = autocorrelation(frame, minLag, maxLag)
+    // 多算一个 lag 作为抛物线插值的右邻居
+    const r = autocorrelation(frame, minLag, maxLag + 1)
 
     let globalMax = 0
     for (let lag = minLag; lag <= maxLag; lag++) {
@@ -228,9 +243,7 @@ function estimateF0(samples, sampleRate) {
     }
     if (globalMax < 0.3) continue // 相关性太弱，判为清音/噪声帧
 
-    // 在所有局部峰里取「最小的那个显著峰」。
-    // 为什么不直接用最高峰：谐波丰富时半周期处也会出现接近的高峰（倍频误检），
-    // 显著峰阈值 + 取最小 lag 可以在真实基频的整数倍关系里优先选长周期（低频）解。
+    // 在所有局部峰里取「最小的那个显著峰」——优先基频而非倍频误检
     let bestLag = -1
     for (let lag = minLag; lag <= maxLag; lag++) {
       const isLocalMax =
@@ -243,8 +256,13 @@ function estimateF0(samples, sampleRate) {
     }
     if (bestLag < 0) continue
 
-    const refined = parabolicPeak(r, bestLag, minLag, maxLag)
+    // 谐波一致性：周期信号在 2 倍 lag 处应同样显著，滤除孤立噪声尖峰
+    const twice = bestLag * 2
+    if (twice <= maxLag + 1 && r[twice] < globalMax * 0.3) continue
+
+    const refined = parabolicPeak(r, bestLag, minLag, maxLag + 1)
     const f0 = sampleRate / refined
+    // 范围守卫：区间外（<60Hz 的嗡鸣 / >400Hz）不算有效基频，该帧丢弃
     if (Number.isFinite(f0) && f0 >= F0_MIN && f0 <= F0_MAX) values.push(f0)
   }
 
@@ -476,12 +494,22 @@ export function cloneFromAudio(decoded, options = {}) {
   const displayName = opts.name ? String(opts.name) : '克隆音色'
   const count = clamp(Math.round(toFinite(opts.count, 3)), 1, MAX_CANDIDATES)
 
+  // 音色方向覆盖：DSP 仅凭基频无法可靠区分童声男孩与成年女声（f0 区间严重重叠），
+  // 219Hz 以上的声音被一刀切判成 female 会把男童声错配成女声嗓子。
+  // 允许用户按素材实际听感显式指定性别方向；缺省时沿用基于 effF0 的自动推断。
+  // 该覆盖只影响「选嗓方向」，不改变从素材实测得到的 pitch/speed/emotion。
+  const genderOverride = ['male', 'female', 'neutral'].includes(opts.genderOverride)
+    ? opts.genderOverride
+    : null
+
   // 偏移幅度由特征本身算出：
   // 越亮、波形越碎的素材，其可调空间越大（合成时更不容易糊）；
   // 越安静平稳的素材可用空间越小，避免把参数推离原素材太远。
   const pitchSpread = clamp(0.03 + 0.05 * brightnessOf(features), 0.02, 0.09)
-  const speedSpread = clamp(0.02 + 0.06 * clamp(toFinite(features.zcr, 0) / 0.12, 0, 1), 0.02, 0.09)
-  const emotionSpread = clamp(0.02 + 0.06 * clamp(toFinite(features.silenceRatio, 0), 0, 1), 0.02, 0.09)
+  // 语速/情绪的候选间距适度放大：原来 speed 极差仅 ~0.04，三个候选听感几乎一致，
+  // 用户会误以为「所有候选都是同一个固定音色」。放大后候选可听辨，仍受 [0.5,2]/[0,1] 钳制。
+  const speedSpread = clamp(0.05 + 0.12 * clamp(toFinite(features.zcr, 0) / 0.12, 0, 1), 0.05, 0.16)
+  const emotionSpread = clamp(0.04 + 0.10 * clamp(toFinite(features.silenceRatio, 0), 0, 1), 0.04, 0.15)
 
   const candidates = []
   for (let i = 0; i < count; i++) {
@@ -494,7 +522,9 @@ export function cloneFromAudio(decoded, options = {}) {
 
     // 基频随音高偏移同步缩放，保证「参数」与「特征」描述一致
     const effF0 = base.pitch > 0 ? clamp(features.f0 * (pitch / base.pitch), 0, F0_MAX) : 0
-    const gender = effF0 <= 0 ? 'neutral' : effF0 < 150 ? 'male' : effF0 > 205 ? 'female' : 'neutral'
+    // 音色方向：显式覆盖优先（用户按素材听感纠正），否则回落到基频自动推断
+    const autoGender = effF0 <= 0 ? 'neutral' : effF0 < 150 ? 'male' : effF0 > 205 ? 'female' : 'neutral'
+    const gender = genderOverride || autoGender
 
     const params = {
       pitch: toFinite(pitch, 1),

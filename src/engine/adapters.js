@@ -4,7 +4,7 @@
 
 import { generateAvatarCandidates } from './avatarGen.js'
 import { decodeAudioFile } from './audioDecode.js'
-import { cloneFromAudio, extractFeatures } from './voiceClone.js'
+import { cloneFromAudio, extractFeatures, deriveParams } from './voiceClone.js'
 
 // ---------- 模型适配器（真实 API，经本地代理）----------
 export const modelAdapter = {
@@ -149,6 +149,85 @@ async function decodeOnce(file) {
   return decoded
 }
 
+// 把用户选择的音频 File 转成 Base64 Data URI，交给本地代理上传给语音平台。
+// 用 FileReader 而非 file.arrayBuffer()，兼容性更好。
+function fileToDataUri(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(new Error('读取音频文件失败'))
+    reader.readAsDataURL(file)
+  })
+}
+
+// 轮询音色部署状态：创建后服务端为 DEPLOYING，需等到 OK 才能合成。
+// 最多等 ~20 秒（10 次 × 2 秒），超时则抛错，由上层降级处理。
+async function waitVoiceReady(voiceId, onProgress) {
+  for (let i = 0; i < 10; i++) {
+    await delay(2000)
+    try {
+      const res = await fetch('/api/tts/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ voiceId }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (data.status === 'OK') return true
+      if (data.status === 'FAILED') throw new Error('平台音色部署失败，请更换样本重试')
+      try { onProgress?.(88 + i, `音色部署中…（${i + 1}/10）`) } catch { /* ignore */ }
+    } catch (e) {
+      // 网络抖动不立即放弃，继续轮询
+      if (/部署失败/.test(e?.message || '')) throw e
+    }
+  }
+  throw new Error('音色部署超时（20s），请稍后在音色列表中重试')
+}
+
+// 真·克隆：通过本地代理调用语音平台创建克隆音色。
+// 返回带 realVoiceId 的候选；任何失败都向上抛，由 clone() 统一降级。
+async function cloneViaCloud(file, name, count, genderOverride, onProgress) {
+  try { onProgress?.(20, '上传样本并创建克隆音色…') } catch { /* ignore */ }
+  const audio = await fileToDataUri(file)
+  const res = await fetch('/api/tts/clone', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ audio }),
+  })
+  let data
+  try { data = await res.json() } catch { data = {} }
+  if (!res.ok || !data.ok) throw new Error(data.error || `音色创建失败（${res.status}）`)
+  const voiceId = data.voiceId
+  try { onProgress?.(85, '等待音色就绪…') } catch { /* ignore */ }
+  await waitVoiceReady(voiceId, onProgress)
+  // 真实特征仍要算：候选卡片展示实测基频/明亮度，与参数面板一致
+  let features = null
+  let params = { pitch: 1, speed: 1, emotion: 0.6, gender: genderOverride || 'neutral' }
+  try {
+    const decoded = await decodeOnce(file)
+    if (decoded.ok) {
+      features = extractFeatures(decoded.samples, decoded.sampleRate)
+      params = deriveParams(features)
+      if (genderOverride && ['male', 'female', 'neutral'].includes(genderOverride)) params.gender = genderOverride
+    }
+  } catch { /* 特征失败不影响真克隆音色本身 */ }
+  // 云克隆一次得到一个真实音色；count=3 时用同一 voiceId 生成不同语速的候选供挑选
+  const list = []
+  for (let i = 0; i < count; i++) {
+    const speedBias = 1 + (i - (count - 1) / 2) * 0.06
+    list.push({
+      id: `${voiceId}::${i}`,
+      voiceId: `${voiceId}::${i}`,
+      realVoiceId: voiceId,
+      ttsMode: 'cloned',
+      name: i === 0 ? name : `${name} · 变体${i + 1}`,
+      params: { ...params, speed: Math.min(2, Math.max(0.5, +(params.speed * speedBias).toFixed(3))) },
+      features,
+      source: 'clone',
+    })
+  }
+  return list
+}
+
 /**
  * 从系统语音列表里挑一条最合适的嗓子。
  * 优先级：中文语音 > 性别匹配 > 任意可用语音。
@@ -211,24 +290,92 @@ export const voiceAdapter = {
    * 找不到匹配性别的语音时降级为默认语音，参数照常生效。
    * @returns {boolean} 是否成功发起发声
    */
+  /**
+   * 用真实克隆音色播报：走本地代理合成音频，再用 <audio> 播放素材本人的声音。
+   * 返回 Promise<boolean>：true=已开始播放，false=合成/播放失败（调用方可降级或提示）。
+   */
+  async speakCloned(text, resource) {
+    const realVoiceId = resource?.realVoiceId || resource?.voiceId
+    if (!realVoiceId) return false
+    try {
+      const res = await fetch('/api/tts/synthesize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voiceId: realVoiceId }),
+      })
+      if (!res.ok) {
+        let msg = `合成失败（${res.status}）`
+        try { msg = (await res.json()).error || msg } catch { /* ignore */ }
+        throw new Error(msg)
+      }
+      const blob = await res.blob()
+      if (blob.size < 32) throw new Error('合成音频为空')
+      const url = URL.createObjectURL(blob)
+      const audio = new Audio(url)
+      audio.onended = () => { try { URL.revokeObjectURL(url) } catch { /* ignore */ } }
+      audio.onerror = () => { try { URL.revokeObjectURL(url) } catch { /* ignore */ } }
+      await audio.play()
+      return true
+    } catch (e) {
+      console.warn('[voiceAdapter] 云端音色播放失败：', e?.message || e)
+      return false
+    }
+  },
+
   speak(text, resource) {
+    // 真克隆音色：异步走云端合成播放。调用方若需要知道结果，可改用 speakAsync()。
+    if (resource && resource.ttsMode === 'cloned' && resource.realVoiceId) {
+      this.speakCloned(text, resource)
+      return true
+    }
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return false
     const synth = window.speechSynthesis
     const params = (resource && resource.params) || {}
     const gender = params.gender || (resource && resource.gender) || 'neutral'
-    const u = new SpeechSynthesisUtterance(String(text ?? ''))
-    u.rate = Math.min(2, Math.max(0.5, Number(params.speed) || 1))
-    u.pitch = Math.min(2, Math.max(0.5, Number(params.pitch) || 1))
-    u.volume = Math.min(1, Math.max(0, Number(params.volume ?? 1)))
-    const picked = pickSystemVoice(synth.getVoices(), gender)
-    if (picked) {
-      u.voice = picked
-      u.lang = picked.lang || 'zh-CN'
-    } else {
-      u.lang = 'zh-CN'
+
+    // 真正的发声动作。把嗓音选择放到拿到列表之后执行——speechSynthesis.getVoices()
+    // 首次调用常返回空数组（列表异步就绪），若此时直接 synthesize 会退化成系统默认嗓音，
+    // 用户会误以为「克隆音色没生效」。这里用 gotVoices 回调在列表就绪后再合成。
+    const synthesize = (rawVoices) => {
+      const u = new SpeechSynthesisUtterance(String(text ?? ''))
+      u.rate = Math.min(2, Math.max(0.5, Number(params.speed) || 1))
+      u.pitch = Math.min(2, Math.max(0.5, Number(params.pitch) || 1))
+      u.volume = Math.min(1, Math.max(0, Number(params.volume ?? 1)))
+      const picked = pickSystemVoice(rawVoices, gender)
+      if (picked) {
+        u.voice = picked
+        u.lang = picked.lang || 'zh-CN'
+      } else {
+        u.lang = 'zh-CN'
+      }
+      synth.cancel()
+      synth.speak(u)
     }
-    synth.cancel()
-    synth.speak(u)
+
+    const immediate = synth.getVoices() || []
+    if (immediate.length > 0) {
+      synthesize(immediate)
+    } else {
+      // 列表尚未就绪：监听 voiceschanged，就绪后用【原始】SpeechSynthesisVoice 列表
+      // 选嗓（pickSystemVoice 依赖 name/lang/localService，不能用转换后的轻量对象）。
+      // 1.5s 超时兜底，超时仍以空列表降级发声，绝不静默失败。
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (typeof synth.removeEventListener === 'function') {
+          synth.removeEventListener('voiceschanged', onChanged)
+        }
+        synthesize(synth.getVoices() || [])
+      }
+      const onChanged = () => { if ((synth.getVoices() || []).length > 0) finish() }
+      const timer = setTimeout(finish, VOICE_LIST_TIMEOUT)
+      if (typeof synth.addEventListener === 'function') {
+        synth.addEventListener('voiceschanged', onChanged)
+      }
+      if ((synth.getVoices() || []).length > 0) finish()
+    }
     return true
   },
 
@@ -239,18 +386,29 @@ export const voiceAdapter = {
    * @returns {Promise<Array>} 候选音色列表
    */
   async clone(file, options = {}) {
-    const { name = '克隆音色', count = 3, seed, onProgress } = options || {}
+    const { name = '克隆音色', count = 3, seed, genderOverride, onProgress } = options || {}
     const report = (pct, label) => { try { onProgress?.(pct, label) } catch { /* 进度回调异常不影响主流程 */ } }
-    report(15, '解码音频中…')
-    const decoded = await decodeOnce(file)
-    if (!decoded.ok) throw new Error(decoded.error || '音频解码失败：文件可能已损坏或格式不受支持')
-    report(45, '提取声纹特征中…')
-    // 特征提取是纯计算，可能耗时较久；让出一次事件循环，保证进度条能刷新
-    await new Promise((r) => setTimeout(r, 0))
-    report(70, '派生候选音色中…')
-    const candidates = cloneFromAudio(decoded, { name, count, seed })
-    report(100, '候选生成完成')
-    return candidates
+
+    // 优先走云端真音色克隆：上传到语音平台创建真实克隆音色，拿到 voice_id。
+    // 这条路才能得到「像素材本人」的声音；失败时降级到本地 DSP 参数化模拟，保证功能可用。
+    try {
+      const cloud = await cloneViaCloud(file, name, count, genderOverride, report)
+      report(100, '克隆音色生成完成（真实声纹）')
+      return cloud
+    } catch (e) {
+      // 云端不可用（未配密钥 / 网络 / 平台拒绝）→ 降级到本地 DSP，并在候选上标注原因
+      const degradeMsg = (e?.message || '云端克隆不可用').slice(0, 120)
+      report(15, '云端不可用，改用本地模式…')
+      const decoded = await decodeOnce(file)
+      if (!decoded.ok) throw new Error(decoded.error || '音频解码失败：文件可能已损坏或格式不受支持')
+      report(45, '提取声纹特征中…')
+      await new Promise((r) => setTimeout(r, 0))
+      report(70, '派生候选音色中…')
+      const candidates = cloneFromAudio(decoded, { name, count, seed, genderOverride })
+        .map((c) => ({ ...c, ttsMode: 'local', degradeReason: degradeMsg }))
+      report(100, '候选生成完成（本地参数化模拟）')
+      return candidates
+    }
   },
 
   /**
