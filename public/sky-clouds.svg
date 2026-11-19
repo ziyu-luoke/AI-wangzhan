@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 320" preserveAspectRatio="none">
+  <!-- 原创手绘风格云朵，柔和半透明白，用于页面顶部天空氛围 -->
+  <defs>
+    <linearGradient id="cloud" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#eaf3f7" stop-opacity="0.55"/>
+    </linearGradient>
+  </defs>
+  <g fill="url(#cloud)">
+    <g transform="translate(120,40)">
+      <ellipse cx="0" cy="0" rx="46" ry="20"/>
+      <ellipse cx="38" cy="-14" rx="40" ry="26"/>
+      <ellipse cx="86" cy="2" rx="44" ry="19"/>
+      <rect x="-30" y="0" width="140" height="20" rx="10"/>
+    </g>
+    <g transform="translate(560,18) scale(1.25)">
+      <ellipse cx="0" cy="0" rx="40" ry="17"/>
+      <ellipse cx="32" cy="-12" rx="34" ry="22"/>
+      <ellipse cx="74" cy="2" rx="38" ry="16"/>
+      <rect x="-24" y="0" width="120" height="17" rx="9"/>
+    </g>
+    <g transform="translate(1080,54) scale(0.9)">
+      <ellipse cx="0" cy="0" rx="48" ry="20"/>
+      <ellipse cx="40" cy="-15" rx="42" ry="27"/>
+      <ellipse cx="90" cy="2" rx="46" ry="19"/>
+      <rect x="-28" y="0" width="145" height="20" rx="10"/>
+    </g>
+    <g transform="translate(1380,26) scale(1.1)">
+      <ellipse cx="0" cy="0" rx="36" ry="15"/>
+      <ellipse cx="28" cy="-11" rx="30" ry="20"/>
+      <ellipse cx="66" cy="2" rx="34" ry="15"/>
+      <rect x="-20" y="0" width="108" height="15" rx="8"/>
+    </g>
+  </g>
+  <!-- 远处飞鸟剪影 -->
+  <g fill="none" stroke="#6b7d6a" stroke-width="2" stroke-linecap="round" opacity="0.5">
+    <path d="M300 120 q8 -7 16 0 q8 -7 16 0"/>
+    <path d="M356 140 q6 -5 12 0 q6 -5 12 0"/>
+    <path d="M980 96 q7 -6 14 0 q7 -6 14 0"/>
+  </g>
+</svg>

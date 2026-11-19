@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 200" preserveAspectRatio="none">
+  <!-- 原创手绘风格远山与草地剪影，用于页面底部自然氛围 -->
+  <defs>
+    <linearGradient id="hillFar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#bcd4c0"/>
+      <stop offset="100%" stop-color="#a9c6b2"/>
+    </linearGradient>
+    <linearGradient id="hillNear" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#9dbb9f"/>
+      <stop offset="100%" stop-color="#83a98c"/>
+    </linearGradient>
+  </defs>
+  <path d="M0 120 Q160 62 320 108 T640 96 T960 112 T1280 88 T1600 104 L1600 200 L0 200 Z" fill="url(#hillFar)" opacity="0.55"/>
+  <path d="M0 152 Q200 108 400 148 T800 140 T1200 152 T1600 136 L1600 200 L0 200 Z" fill="url(#hillNear)" opacity="0.6"/>
+  <!-- 草叶点缀 -->
+  <g stroke="#6f9579" stroke-width="2" stroke-linecap="round" opacity="0.5">
+    <path d="M120 200 q-4 -18 -12 -26 M126 200 q4 -20 12 -28"/>
+    <path d="M520 200 q-5 -16 -13 -24 M526 200 q5 -18 13 -26"/>
+    <path d="M1120 200 q-4 -18 -12 -26 M1126 200 q4 -20 12 -28"/>
+    <path d="M1440 200 q-5 -16 -13 -24 M1446 200 q5 -18 13 -26"/>
+  </g>
+</svg>
