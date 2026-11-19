@@ -166,6 +166,18 @@ export async function saveAvatarExpressions(avatarId, images) {
   return refs
 }
 
+/**
+ * 把单张表情图写入指定 key（编辑替换时用带版本的新 key，确保引用变化触发头像组件刷新）。
+ * 成功写库后清掉内存兜底；写库失败则退化到内存 Map，保证本次会话可用。
+ */
+export async function putAvatarExpression(key, blob) {
+  if (!key || !blob) return false
+  const ok = await idbPut(key, blob)
+  if (ok) memoryBlobs.delete(key)
+  else memoryBlobs.set(key, blob)
+  return ok
+}
+
 /** 读取图片 Blob（IndexedDB 优先，内存兜底） */
 export async function loadAvatarExpressionBlob(key) {
   if (!key) return null

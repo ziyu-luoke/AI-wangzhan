@@ -7,8 +7,9 @@ import Modal from '../components/Modal.jsx'
 import AvatarFace from '../components/AvatarFace.jsx'
 import { avatarAdapter, delay } from '../engine/adapters.js'
 import {
-  EXPRESSION_KEYS, EXPRESSION_LABELS, normalizeExpressionImage,
-  saveAvatarExpressions, loadAvatarExpressionUrl, revokeExpressionUrl,
+  EXPRESSION_KEYS, EXPRESSION_LABELS, expressionKey, normalizeExpressionImage,
+  saveAvatarExpressions, loadAvatarExpressionUrls, putAvatarExpression,
+  deleteAvatarExpressions, revokeExpressionUrl,
 } from '../engine/avatarAssets.js'
 
 const emptyForm = () => ({
@@ -30,6 +31,12 @@ export default function AvatarPage() {
   const [editing, setEditing] = useState(null)
   const [form, setForm] = useState(null)
   const [confirmDel, setConfirmDel] = useState(null)
+  // 编辑态的表情图：editPreviews=当前已存图 url，editPending=待替换的新图 blob，editRemoved=待清空的图
+  const [editPreviews, setEditPreviews] = useState({})
+  const [editPending, setEditPending] = useState({})
+  const [editRemoved, setEditRemoved] = useState([])
+  const [editBusy, setEditBusy] = useState(false)
+  const editFileRefs = useRef({})
   const avatars = state.resources.avatar
   const using = state.draftBinding.avatarId
 
@@ -41,19 +48,69 @@ export default function AvatarPage() {
   const [busy, setBusy] = useState(false)
   const fileRef = useRef(null)
 
-  const openNew = () => { setForm(emptyForm()); setEditing('new'); setMascot('happy', '来做新形象吧！') }
-  const openEdit = (item) => { setForm(JSON.parse(JSON.stringify(item))); setEditing(item.id) }
-  const close = () => { setEditing(null); setForm(null) }
+  const resetEditImages = () => { setEditPreviews({}); setEditPending({}); setEditRemoved([]); setEditBusy(false) }
+  const openNew = () => { resetEditImages(); setForm(emptyForm()); setEditing('new'); setMascot('happy', '来做新形象吧！') }
+  const openEdit = async (item) => {
+    resetEditImages()
+    setForm(JSON.parse(JSON.stringify(item))); setEditing(item.id)
+    // 异步加载已存的表情图，做成可预览的 objectURL（缺图则留空，界面显示 emoji 兜底）
+    try { setEditPreviews(await loadAvatarExpressionUrls(item.expressionImages || {})) }
+    catch { setEditPreviews({}) }
+  }
+  const close = () => { setEditing(null); setForm(null); resetEditImages() }
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }))
 
-  const save = () => {
+  // 编辑态：为某类表情挑选替换图（统一 240×240，不拉伸不裁切）
+  const onEditPick = async (expr, e) => {
+    const f = e.target.files?.[0]
+    e.target.value = ''
+    if (!f) return
+    try {
+      const norm = await normalizeExpressionImage(f)
+      setEditPending((p) => ({ ...p, [expr]: { blob: norm.blob, previewUrl: norm.previewUrl } }))
+      setEditRemoved((prev) => prev.filter((k) => k !== expr))
+      toast(`${EXPRESSION_LABELS[expr]}图片已就绪，保存后生效`, 'success')
+    } catch (err) { toast(err.message, 'error') }
+  }
+
+  // 编辑态：移除某类表情图（保存后该类回退到 emoji 兜底）
+  const onEditRemove = (expr) => {
+    setEditPending((p) => { const n = { ...p }; delete n[expr]; return n })
+    setEditRemoved((prev) => prev.includes(expr) ? prev : [...prev, expr])
+  }
+
+  const save = async () => {
     if (!form.name.trim()) { toast('请填写形象名称', 'error'); setMascot('error', '名字没填哦～'); return }
     try {
-      if (editing === 'new') { store.createResource('avatar', form); toast(`形象「${form.name}」已创建`, 'success') }
-      else { const cur = store.getResource('avatar', editing); store.updateResource('avatar', editing, form, cur.version); toast(`形象「${form.name}」已保存`, 'success') }
+      if (editing === 'new') {
+        store.createResource('avatar', form); toast(`形象「${form.name}」已创建`, 'success')
+      } else {
+        setEditBusy(true); setMascot('thinking', '正在保存表情图…')
+        const cur = store.getResource('avatar', editing)
+        const nextImages = { ...(form.expressionImages || {}) }
+        // ① 替换/新增：用带版本的新 key 写入，避免旧 objectURL 缓存导致头像不刷新
+        for (const expr of Object.keys(editPending)) {
+          const { blob } = editPending[expr]
+          const oldKey = nextImages[expr]
+          const newKey = `${expressionKey(editing, expr)}-v${Date.now().toString(36)}`
+          await putAvatarExpression(newKey, blob)
+          if (oldKey) { revokeExpressionUrl(oldKey); await deleteAvatarExpressions({ [expr]: oldKey }) }
+          nextImages[expr] = newKey
+        }
+        // ② 移除：清掉图片库记录与引用，对话侧自动回退 emoji
+        for (const expr of editRemoved) {
+          const oldKey = nextImages[expr]
+          if (oldKey) { revokeExpressionUrl(oldKey); await deleteAvatarExpressions({ [expr]: oldKey }) }
+          delete nextImages[expr]
+        }
+        store.updateResource('avatar', editing, { ...form, expressionImages: nextImages }, cur.version)
+        const changed = Object.keys(editPending).length + editRemoved.length
+        toast(changed ? `形象「${form.name}」已保存（更新 ${changed} 类表情图）` : `形象「${form.name}」已保存`, 'success')
+      }
       setMascot('love', '形象保存好啦！')
       close()
-    } catch (e) { toast(e.message, 'error') }
+    } catch (e) { toast(e.message, 'error'); setMascot('error', '保存失败啦…') }
+    finally { setEditBusy(false) }
   }
 
   const doToggle = (item) => { try { store.toggleResource('avatar', item.id) } catch (e) { toast(e.message, 'error') } }
@@ -185,7 +242,7 @@ export default function AvatarPage() {
 
       {/* 手动新增/编辑抽屉（保留 emoji 方式，兼容老形象） */}
       <Modal open={!!editing && !genOpen} title={editing === 'new' ? '➕ 手动新增形象' : '✏️ 编辑形象'} onClose={close}
-        footer={<><button className="btn" onClick={close}>取消</button><button className="btn btn-primary" onClick={save}>💾 保存</button></>}>
+        footer={<><button className="btn" onClick={close}>取消</button><button className="btn btn-primary" onClick={save} disabled={editBusy}>💾 {editBusy ? '保存中…' : '保存'}</button></>}>
         {form && <>
           <div className="form-section">
             <h4>📝 基础信息</h4>
@@ -196,13 +253,38 @@ export default function AvatarPage() {
             <div className="field"><label>代表 Emoji</label><input className="input" value={form.emoji} onChange={(e) => set('emoji', e.target.value)} placeholder="🤖" /></div>
           </div>
           <div className="form-section">
-            <h4>😊 表情映射（缺图时的兜底 emoji）</h4>
-            <div className="field-row">
-              {EXPRESSION_KEYS.map((k) => (
-                <div className="field" key={k}><label>{EXPRESSION_LABELS[k]}</label><input className="input" value={form.expressions?.[k] || ''} onChange={(e) => set('expressions', { ...form.expressions, [k]: e.target.value })} /></div>
-              ))}
+            <h4>😊 五类表情图（可逐张替换 / 移除）</h4>
+            <p className="tiny muted">每类一张，替换时自动等比缩放到 240×240（不拉伸、不裁切）。移除后该类在对话中回退到下方 emoji 兜底。</p>
+            <div className="expr-edit-list">
+              {EXPRESSION_KEYS.map((k) => {
+                const previewUrl = editPending[k]?.previewUrl || (!editRemoved.includes(k) ? editPreviews[k] : null)
+                const hasImage = !!(editPending[k] || (!editRemoved.includes(k) && form.expressionImages?.[k]))
+                return (
+                  <div className="expr-edit-row" key={k}>
+                    <div className="expr-edit-thumb">
+                      {previewUrl ? <img src={previewUrl} alt={EXPRESSION_LABELS[k]} /> : <span>{form.expressions?.[k] || '🤖'}</span>}
+                    </div>
+                    <div className="expr-edit-main">
+                      <div className="expr-edit-line">
+                        <b>{EXPRESSION_LABELS[k]}</b>
+                        <span className="tag">{hasImage ? '有图' : '缺图 → emoji'}</span>
+                        {editPending[k] && <span className="tag tag-on">待保存</span>}
+                        {editRemoved.includes(k) && <span className="tag">待移除</span>}
+                      </div>
+                      <div className="expr-edit-line">
+                        <button className="btn btn-sm btn-blue" onClick={() => editFileRefs.current[k]?.click()}>🔄 替换图片</button>
+                        {hasImage && <button className="btn btn-sm btn-ghost" onClick={() => onEditRemove(k)}>🗑️ 移除图片</button>}
+                        <input ref={(el) => { editFileRefs.current[k] = el }} type="file" accept="image/*" hidden onChange={(e) => onEditPick(k, e)} />
+                      </div>
+                      <div className="expr-edit-line">
+                        <label>兜底 emoji</label>
+                        <input className="input" value={form.expressions?.[k] || ''} onChange={(e) => set('expressions', { ...form.expressions, [k]: e.target.value })} />
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
             </div>
-            <p className="tiny muted">手动方式不上传图片；对话演示会用上面的 emoji 兜底。需要图片形象请用「上传表情图集新建」。</p>
           </div>
         </>}
       </Modal>
