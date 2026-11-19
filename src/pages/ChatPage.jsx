@@ -7,6 +7,7 @@ import { stopClonedSpeech } from '../engine/adapters.js'
 import { stripMeta } from '../engine/textClean.js'
 import AvatarFace from '../components/AvatarFace.jsx'
 import { detectMood, dominantMood, MOOD_EMOJI } from '../engine/moodEngine.js'
+import { identitySummary } from '../engine/personaHelper.js'
 
 const QUICK = ['今天天气真好呀！', '给我讲个冷笑话', '你是谁呀？', '周末去哪玩？']
 
@@ -16,6 +17,9 @@ export default function ChatPage() {
   const { toast, setMascot } = useUI()
   const session = state.sessions[0]
   const config = resolveActiveConfig()
+  // AI 身份名 = 当前生效虚拟形象名；无形象时才回退人设名/中性称呼，绝不写死"小智"
+  const aiName = config.avatar?.name || config.persona?.name || 'AI 助手'
+  const identity = identitySummary(config.avatar, config.persona)
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState('')
   const [busy, setBusy] = useState(false)
@@ -136,7 +140,7 @@ export default function ChatPage() {
           <div className="sim-head">
             <AvatarFace avatar={config.avatar} mood={topMood} className="sim-avatar" />
             <div>
-              <div>{config.avatar?.name || '小智'}</div>
+              <div>{aiName}</div>
               <div className="tiny" style={{ opacity: .85, fontFamily: 'var(--font-body)' }}>
                 会话 {session.sessionId} · 话题：{session.topic} · 上下文 {session.context.length} 条
               </div>
@@ -156,7 +160,7 @@ export default function ChatPage() {
                     ? <div className="sim-face">😊</div>
                     : <AvatarFace avatar={config.avatar} mood={mood} className="sim-face" />}
                   <div style={{ maxWidth: '76%' }}>
-                    <div className="who">{m.role === 'user' ? '我' : config.avatar?.name || '小智'} · <span className="muted">v{m.configVersion ?? 0}</span></div>
+                    <div className="who">{m.role === 'user' ? '我' : aiName} · <span className="muted">v{m.configVersion ?? 0}</span></div>
                     <div className={`chat-bubble ${m.role === 'user' ? 'user' : 'bot'}`}>{isAssistant ? stripMeta(m.content) : m.content}</div>
                   </div>
                 </div>
@@ -166,7 +170,7 @@ export default function ChatPage() {
               <div className="sim-msg">
                 <AvatarFace avatar={config.avatar} mood="thinking" className="sim-face" />
                 <div style={{ maxWidth: '76%' }}>
-                  <div className="who">{config.avatar?.name || '小智'} · 正在生成</div>
+                  <div className="who">{aiName} · 正在生成</div>
                   <div className="chat-bubble bot">{stripMeta(streaming)}<span className="blink">▍</span></div>
                 </div>
               </div>
@@ -175,7 +179,7 @@ export default function ChatPage() {
           </div>
 
           <div className="sim-input-bar">
-            <input className="input" value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKey} placeholder="和小智说点什么…（Enter 发送）" disabled={busy} />
+            <input className="input" value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKey} placeholder={`和${aiName}说点什么…（Enter 发送）`} disabled={busy} />
             <button className="btn btn-primary" onClick={() => send()} disabled={busy || !input.trim()}>{busy ? '⏳' : '➤ 发送'}</button>
           </div>
           <div className="row wrap" style={{ padding: '0 12px 12px', gap: 6 }}>
@@ -192,13 +196,22 @@ export default function ChatPage() {
               ['🧠', 'AI 模型', config.model?.name],
               ['🎨', '虚拟形象', config.avatar?.name],
               ['🎵', '语音音色', config.voice?.name],
-              ['💖', 'AI 人设', config.persona?.name],
+              ['💖', 'AI 人设', config.avatar?.persona?.content ? '形象专属' : (config.persona?.name || '全局人设')],
             ].map(([emoji, type, name]) => (
               <div className="active-item" key={type}>
                 <span className="a-emoji">{emoji}</span>
                 <div><div className="a-type">{type}</div><div className="a-name">{name || '—'}</div></div>
               </div>
             ))}
+          </div>
+
+          {/* 当前 AI 身份：直接展示本轮对话使用的身份/语气/背景，便于验证切换即时生效且不串扰 */}
+          <div className="voice-detail">
+            <div className="vd-head"><b className="tiny">🪪 当前 AI 身份</b><span className="tag tag-on">{aiName}</span></div>
+            <div className="tiny muted vd-line">对话中以此名称自称；切到别的形象并经发布中心生效后，下一轮立即换成对应身份。</div>
+            <div className="tiny muted vd-line">语气：<b>{identity.tags.join('、') || '默认'}</b></div>
+            {(config.avatar?.persona?.background) && <div className="tiny muted vd-line">背景：{config.avatar.persona.background}</div>}
+            {!config.avatar?.persona?.content && <div className="tiny muted vd-line">该形象无专属人设，回退到全局人设「{config.persona?.name || '默认'}」。</div>}
           </div>
 
           {/* 形象表情图状态：验证 5 类图是否齐全 */}
@@ -240,7 +253,12 @@ export default function ChatPage() {
               <div className="ctx-msg" key={i}>
                 <span className="ctx-tag">{m.role === 'user' ? '👤 用户' : m.role === 'system' ? '⚙️ 系统' : '🤖 助手'}</span>
                 <span className="muted"> · v{m.configVersion ?? 0}</span><br />
-                {(() => { const t = m.role === 'assistant' ? stripMeta(m.content) : m.content; return t.slice(0, 46) + (t.length > 46 ? '…' : '') })()}
+                {(() => {
+                  // 动态身份条目随当前生效形象变化，避免历史里残留固定"小智"
+                  if (m.role === 'system' && m.dynamic) return `当前身份：${aiName}（语气：${identity.tags.join('、') || '默认'}）`
+                  const t = m.role === 'assistant' ? stripMeta(m.content) : m.content
+                  return t.slice(0, 46) + (t.length > 46 ? '…' : '')
+                })()}
               </div>
             ))}
           </div>

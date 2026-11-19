@@ -42,15 +42,18 @@ export function resolveActiveConfig() {
     voice: normalizeVoice(voice),
     persona: s.resources.persona.find(r => r.id === b.personaId),
     version: s.currentVersion,
+    sessionId: s.sessions[0]?.sessionId,
   }
 }
 
 // 生成机器人回复（真实模型流式调用，经本地安全代理）
 export async function streamReply(userText, config, onChunk) {
   const s = store.getState()
-  const session = s.sessions[0]
-  // 构造规范消息：人设插值成 system + 最近 6 条上下文 + 当前输入
-  const systemPrompt = buildSystemPrompt(config.persona, session.identity || {})
+  const session = s.sessions.find((x) => x.sessionId === config.sessionId) || s.sessions[0]
+  // 构造规范消息：以「当前生效虚拟形象」的身份+人设插值成 system
+  // （形象名 = AI 自称；形象专属人设优先，全局人设兜底），+ 最近 6 条上下文 + 当前输入。
+  // 历史消息里 role=system 的旧条目一律剔除，彻底避免旧的固定身份被带入造成串扰。
+  const systemPrompt = buildSystemPrompt(config.persona, session.identity || {}, config.avatar)
   const canonical = [
     { role: 'system', content: systemPrompt },
     ...session.context.filter((m) => m.role !== 'system').slice(-6).map((m) => ({ role: m.role, content: m.content })),

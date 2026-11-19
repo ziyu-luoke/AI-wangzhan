@@ -12,14 +12,24 @@ import {
   deleteAvatarExpressions, revokeExpressionUrl,
 } from '../engine/avatarAssets.js'
 
+const emptyPersona = (name = '') => ({
+  name: name || '',
+  content: name ? `你是「{avatar_name}」，一个温柔贴心、活泼可爱的 AI 伙伴。你正在和{user_name}对话，说话简洁、有温度。` : '',
+  toneTags: ['温柔', '活泼'],
+  background: '',
+  fallbackReply: '',
+})
 const emptyForm = () => ({
   name: '', avatarType: '2D虚拟形象', source: '上传图集',
   emoji: '🤖',
   expressions: { happy: '😄', thinking: '🤔', surprised: '😲', angry: '😠', idle: '🤖' },
   expressionImages: {},
+  persona: emptyPersona(),
   generateParams: {},
   enabled: true, previewUrl: '', deviceCompat: { screen: '240x320 SPI', minFirmware: '2.0.0' },
 })
+
+const TONE_PRESETS = ['温柔', '活泼', '专业', '严谨', '幽默', '治愈', '元气', '二次元', '傲娇', '沉稳', '可爱', '文艺']
 
 // 生成流程：上传素材 → 标注表情并规范到 240x240 → 创建
 const STEPS = ['上传素材', '标注表情', '创建完成']
@@ -81,9 +91,12 @@ export default function AvatarPage() {
 
   const save = async () => {
     if (!form.name.trim()) { toast('请填写形象名称', 'error'); setMascot('error', '名字没填哦～'); return }
+    // 人设名称始终跟随形象名，避免两处名字不一致导致对话身份混乱
+    const persona = { ...(form.persona || emptyPersona(form.name)), name: form.name.trim() }
+    const payload = { ...form, persona }
     try {
       if (editing === 'new') {
-        store.createResource('avatar', form); toast(`形象「${form.name}」已创建`, 'success')
+        store.createResource('avatar', payload); toast(`形象「${form.name}」已创建`, 'success')
       } else {
         setEditBusy(true); setMascot('thinking', '正在保存表情图…')
         const cur = store.getResource('avatar', editing)
@@ -103,7 +116,7 @@ export default function AvatarPage() {
           if (oldKey) { revokeExpressionUrl(oldKey); await deleteAvatarExpressions({ [expr]: oldKey }) }
           delete nextImages[expr]
         }
-        store.updateResource('avatar', editing, { ...form, expressionImages: nextImages }, cur.version)
+        store.updateResource('avatar', editing, { ...payload, expressionImages: nextImages }, cur.version)
         const changed = Object.keys(editPending).length + editRemoved.length
         toast(changed ? `形象「${form.name}」已保存（更新 ${changed} 类表情图）` : `形象「${form.name}」已保存`, 'success')
       }
@@ -195,6 +208,8 @@ export default function AvatarPage() {
         name,
         expressionImages: refs,
         expressions: emojiFallback,
+        // 以形象名生成初始人设模板；用户可在「编辑形象」里改成专属人设/语气/背景
+        persona: { ...emptyPersona(name), name },
         source: '上传图集',
         generateParams: { mode: 'manual-tag', size: '240x240', tagged: tagged.map((a) => a.tag) },
       }
@@ -232,8 +247,12 @@ export default function AvatarPage() {
                 ['类型', a.avatarType],
                 ['来源', a.source],
                 ['表情图', `${Object.keys(a.expressionImages || {}).length}/5 类`],
+                ['人设语气', (a.persona?.toneTags || []).join('、') || '回退全局'],
               ]}
-              tags={Object.keys(a.expressionImages || {}).length ? ['表情图集'] : [a.avatarType]}
+              tags={[
+                ...(Object.keys(a.expressionImages || {}).length ? ['表情图集'] : [a.avatarType]),
+                ...(a.persona?.content ? ['独立人设'] : []),
+              ]}
               onEdit={() => openEdit(a)} onToggle={() => doToggle(a)} onDelete={() => doDelete(a)}
             />
           ))}
@@ -285,6 +304,44 @@ export default function AvatarPage() {
                 )
               })}
             </div>
+          </div>
+          <div className="form-section">
+            <h4>💖 AI 人设（对话时以此身份回应）</h4>
+            <p className="tiny muted">每个形象有独立人设，切换形象后对话立即以该身份、语气和背景回应，不同形象互不串扰。留空则回退到全局 AI 人设。</p>
+            {(() => {
+              const p = form.persona || emptyPersona(form.name)
+              const setP = (k, v) => set('persona', { ...p, [k]: v })
+              const toggleTone = (t) => setP('toneTags', p.toneTags.includes(t) ? p.toneTags.filter((x) => x !== t) : [...p.toneTags, t])
+              return <>
+                <div className="field">
+                  <label>人设内容（支持 &#123;avatar_name&#125;、&#123;user_name&#125; 变量）</label>
+                  <textarea className="textarea" value={p.content || ''} onChange={(e) => setP('content', e.target.value)}
+                    placeholder={'你是「{avatar_name}」，一个……\n你正在和{user_name}对话……'} style={{ minHeight: 96 }} />
+                </div>
+                <div className="field">
+                  <label>背景设定</label>
+                  <input className="input" value={p.background || ''} onChange={(e) => setP('background', e.target.value)} placeholder="如：喜欢看动漫，梦想开一家甜品店" />
+                </div>
+                <div className="field">
+                  <label>语气标签</label>
+                  <div className="row wrap">
+                    {TONE_PRESETS.map((t) => (
+                      <button key={t} className="tag" style={{ cursor: 'pointer', background: p.toneTags.includes(t) ? 'var(--clover, #7ba05b)' : '#eef3ea', borderWidth: '2px' }} onClick={() => toggleTone(t)}>
+                        {p.toneTags.includes(t) ? '✓ ' : ''}{t}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="field">
+                  <label>异常兜底回复</label>
+                  <input className="input" value={p.fallbackReply || ''} onChange={(e) => setP('fallbackReply', e.target.value)} placeholder="如：呜…我这边开小差了，请再说一遍好吗？" />
+                </div>
+                <div className="row mt">
+                  <button className="btn btn-sm btn-ghost" onClick={() => set('persona', emptyPersona(form.name))}>↺ 重置为默认模板</button>
+                  <span className="tiny muted">提示：身份名称自动取形象名，无需在内容里写死"小智"。</span>
+                </div>
+              </>
+            })()}
           </div>
         </>}
       </Modal>

@@ -135,6 +135,12 @@ function seedResources() {
         expressions: { happy: '😄', thinking: '🤔', surprised: '😲', error: '😵', idle: '🤖' },
         deviceCompat: { screen: '240x320 SPI', minFirmware: '2.0.0' },
         generateParams: {}, enabled: true,
+        persona: {
+          name: '小智 · 经典款',
+          content: '你是「{avatar_name}」，一个温柔贴心、活泼可爱的 AI 语音助手。你正在和{user_name}对话，说话简洁、有温度，偶尔卖个萌。',
+          toneTags: ['温柔', '活泼'],
+          background: '住在小智配置台里，喜欢陪用户聊天、讲笑话、出主意。',
+        },
         version: 1, createdAt: '2026-11-01 10:00', updatedAt: '2026-11-01 10:00',
       },
       {
@@ -144,6 +150,12 @@ function seedResources() {
         expressions: { happy: '🌸', thinking: '💭', surprised: '😳', error: '🥺', idle: '🌷' },
         deviceCompat: { screen: '240x320 SPI', minFirmware: '2.0.0' },
         generateParams: { style: '日系赛璐璐', resolution: '512x512', background: '透明' },
+        persona: {
+          name: '樱花酱',
+          content: '你是「{avatar_name}」，一位来自樱花国的二次元少女，元气满满、古灵精怪，说话带着软软的关西腔口癖。你正在和{user_name}聊天，总能把平凡的小事讲得热气腾腾。',
+          toneTags: ['元气', '二次元', '可爱'],
+          background: '喜欢看动漫、收集樱花周边，梦想是开一家自己的甜品店。',
+        },
         enabled: true,
         version: 2, createdAt: '2026-11-08 15:30', updatedAt: '2026-11-12 09:20',
       },
@@ -215,8 +227,8 @@ function seedState() {
       identity: { userName: '小主人' }, topic: '周末去哪里玩',
       configVersion: 0, status: 'active', pendingSwitch: false,
       context: [
-        { role: 'system', content: '你是小智，温柔贴心的助手。', configVersion: 0 },
-        { role: 'user', content: '小智，周末我们去哪里玩呀？', configVersion: 0 },
+        { role: 'system', content: '（身份由当前生效的虚拟形象动态决定）', configVersion: 0, dynamic: true },
+        { role: 'user', content: '周末我们去哪里玩呀？', configVersion: 0 },
         { role: 'assistant', content: '可以去公园野餐呀，天气据说很不错呢～', configVersion: 0 },
       ],
       switchHistory: [],
@@ -258,8 +270,10 @@ class ConsoleStore {
     return fresh
   }
 
-  // 归一化形象资源字段（向后兼容）：旧形象没有 expressionImages，补空对象即可，
-  // 对话侧会回退到内置 emoji。缺图/未绑定都不报错。
+  // 归一化形象资源字段（向后兼容）：
+  //  - expressionImages 缺图片库引用补空对象，对话侧回退 emoji
+  //  - persona 为该形象专属的人设（身份/内容/语气/背景）。老形象若没有，不强行塞默认值，
+  //    对话侧会回退到全局绑定的 AI 人设，避免老数据突然换性格。
   normalizeAvatarFields(state) {
     for (const a of state.resources?.avatar || []) {
       if (!a.expressionImages || typeof a.expressionImages !== 'object') a.expressionImages = {}
@@ -267,6 +281,12 @@ class ConsoleStore {
       if (!('angry' in ex)) ex.angry = '😠'
       if (!('idle' in ex)) ex.idle = '🤖'
       a.expressions = ex
+      if (a.persona && typeof a.persona === 'object') {
+        const p = a.persona
+        if (!Array.isArray(p.toneTags)) p.toneTags = []
+        if (typeof p.content !== 'string') p.content = ''
+        if (typeof p.background !== 'string') p.background = ''
+      }
     }
   }
 
