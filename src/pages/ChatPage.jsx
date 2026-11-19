@@ -5,6 +5,8 @@ import { useUI } from '../components/UIContext.jsx'
 import { resolveActiveConfig, streamReply, consumeSafePoint, playTTS } from '../engine/chatEngine.js'
 import { stopClonedSpeech } from '../engine/adapters.js'
 import { stripMeta } from '../engine/textClean.js'
+import AvatarFace from '../components/AvatarFace.jsx'
+import { detectMood, dominantMood, MOOD_EMOJI } from '../engine/moodEngine.js'
 
 const QUICK = ['今天天气真好呀！', '给我讲个冷笑话', '你是谁呀？', '周末去哪玩？']
 
@@ -18,6 +20,7 @@ export default function ChatPage() {
   const [streaming, setStreaming] = useState('')
   const [busy, setBusy] = useState(false)
   const [botMood, setBotMood] = useState('idle')
+  const [activeMsgMood, setActiveMsgMood] = useState(null) // 正在朗读的那条助手消息的气质（按句变化）
   const msgsEndRef = useRef(null)
   const timersRef = useRef([])
 
@@ -25,13 +28,16 @@ export default function ChatPage() {
     msgsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [session.context.length, streaming])
 
-  useEffect(() => () => timersRef.current.forEach(clearTimeout), [])
+  useEffect(() => () => {
+    timersRef.current.forEach(clearTimeout)
+    stopClonedSpeech()
+  }, [])
 
   const send = async (text) => {
     const msg = (text || input).trim()
     if (!msg || busy) return
     setInput(''); setBusy(true); setStreaming('')
-    setBotMood('thinking'); setMascot('thinking', '让我想想…', 0)
+    setBotMood('thinking'); setActiveMsgMood(null); setMascot('thinking', '让我想想…', 0)
     // 新一轮开始：打断上一轮尚未播完的克隆语音，避免两段声音叠加
     stopClonedSpeech()
 
@@ -45,23 +51,46 @@ export default function ChatPage() {
 
     setStreaming('')
     store.appendMessage(session.sessionId, 'assistant', finalText)
-    setBotMood('happy'); setMascot('happy', '说完啦！')
+
+    // 朗读开始：顶部头像先用正文推断出的主语气，随后随每一句切换
+    const startMood = dominantMood(finalText)
+    setBotMood(startMood)
+    setActiveMsgMood(startMood)
+    setMascot(startMood, '说完啦！')
+
+    // 朗读完成：头像与历史消息统一回落到 idle 图
+    const onSpeechSentence = (sentence) => {
+      const mood = detectMood(sentence) || 'idle'
+      setBotMood(mood)
+      setActiveMsgMood(mood)
+    }
+    const onSpeechDone = () => {
+      setBotMood('idle')
+      setActiveMsgMood(null)
+    }
 
     // 语音播报：真克隆音色走云端合成（本人声音），本地音色用系统语音 + 派生参数
     const voiceName = config.voice?.name || '默认音色'
+    let speechStarted = false
     if (!config.voice) {
       toast('未加载生效音色，请到发布中心绑定后再试', 'warn')
     } else if (config.voice.ttsMode === 'cloned' && config.voice.realVoiceId) {
-      playTTS(finalText, config) // 云端异步合成播放；失败时内部会 console.warn 并降级静默
+      speechStarted = playTTS(finalText, config, { onSentence: onSpeechSentence, onDone: onSpeechDone })
       toast(`正在用克隆音色「${voiceName}」播放`, 'info')
     } else {
       const speaks = typeof window !== 'undefined' && 'speechSynthesis' in window
-      const played = speaks ? playTTS(finalText, config) : false
+      const played = speaks ? playTTS(finalText, config, { onSentence: onSpeechSentence, onDone: onSpeechDone }) : false
+      speechStarted = !!played
       if (!speaks) {
         toast('当前浏览器不支持语音合成，回复已正常显示（音色播放不可用）', 'warn')
       } else if (!played) {
         toast(`音色「${voiceName}」无正文可播报`, 'info')
       }
+    }
+    // 无正文可播时，直接回落 idle，避免头像卡在 thinking
+    if (!speechStarted) {
+      const t0 = setTimeout(onSpeechDone, 400)
+      timersRef.current.push(t0)
     }
 
     // === 安全点：TTS 播完的这一刻，消费配置变更 ===
@@ -72,6 +101,8 @@ export default function ChatPage() {
         toast(`✅ 已在安全点切换到 v${switched.configVersion}，会话与 ${switched.context.length} 条上下文完整保留`, 'success')
         setMascot('surprised', `切换到 v${switched.configVersion} 啦！`, 3200)
         setBotMood('surprised')
+        const tReset = setTimeout(() => setBotMood('idle'), 1400)
+        timersRef.current.push(tReset)
       }
       setBusy(false)
     }, 500)
@@ -80,19 +111,20 @@ export default function ChatPage() {
 
   const onKey = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }
 
-  const moodEmoji = {
-    idle: config.avatar?.emoji || '🤖',
-    thinking: config.avatar?.expressions?.thinking || '🤔',
-    happy: config.avatar?.expressions?.happy || '😄',
-    surprised: config.avatar?.expressions?.surprised || '😲',
-  }
+  // 顶部头像 / 每条消息头像都走 AvatarFace：有对应表情图就显示图，否则显示内置 emoji
+  const topMood = botMood
+  const visible = session.context.filter((m) => m.role !== 'system')
+  const lastAssistantIdx = (() => {
+    for (let i = visible.length - 1; i >= 0; i--) if (visible[i].role === 'assistant') return i
+    return -1
+  })()
 
   return (
     <div>
       <div className="page-head">
         <div>
           <h2>💬 对话演示</h2>
-          <p>在此验证：配置发布后下一个轮次即生效，且会话上下文、身份、话题完整保留。</p>
+          <p>在此验证：配置发布后下一个轮次即生效，且会话上下文、身份、话题完整保留；头像随回答语气切换，读完回落 idle。</p>
         </div>
         <span className="spacer" />
         {session.pendingSwitch && <span className="badge warn">⏳ 有配置待切换 · 本轮结束后生效</span>}
@@ -102,7 +134,7 @@ export default function ChatPage() {
         {/* 对话窗口 */}
         <div className="sim-window">
           <div className="sim-head">
-            <div className="sim-avatar">{moodEmoji[botMood]}</div>
+            <AvatarFace avatar={config.avatar} mood={topMood} className="sim-avatar" />
             <div>
               <div>{config.avatar?.name || '小智'}</div>
               <div className="tiny" style={{ opacity: .85, fontFamily: 'var(--font-body)' }}>
@@ -114,18 +146,25 @@ export default function ChatPage() {
           </div>
 
           <div className="sim-msgs">
-            {session.context.filter((m) => m.role !== 'system').map((m, i) => (
-              <div className={`sim-msg ${m.role === 'user' ? 'user' : ''}`} key={i}>
-                <div className="sim-face">{m.role === 'user' ? '😊' : (config.avatar?.emoji || '🤖')}</div>
-                <div style={{ maxWidth: '76%' }}>
-                  <div className="who">{m.role === 'user' ? '我' : config.avatar?.name || '小智'} · <span className="muted">v{m.configVersion ?? 0}</span></div>
-                  <div className={`chat-bubble ${m.role === 'user' ? 'user' : 'bot'}`}>{m.role === 'assistant' ? stripMeta(m.content) : m.content}</div>
+            {visible.map((m, i) => {
+              const isAssistant = m.role === 'assistant'
+              const isSpeaking = isAssistant && i === lastAssistantIdx && !!activeMsgMood
+              const mood = isSpeaking ? activeMsgMood : 'idle'
+              return (
+                <div className={`sim-msg ${m.role === 'user' ? 'user' : ''}`} key={i}>
+                  {m.role === 'user'
+                    ? <div className="sim-face">😊</div>
+                    : <AvatarFace avatar={config.avatar} mood={mood} className="sim-face" />}
+                  <div style={{ maxWidth: '76%' }}>
+                    <div className="who">{m.role === 'user' ? '我' : config.avatar?.name || '小智'} · <span className="muted">v{m.configVersion ?? 0}</span></div>
+                    <div className={`chat-bubble ${m.role === 'user' ? 'user' : 'bot'}`}>{isAssistant ? stripMeta(m.content) : m.content}</div>
+                  </div>
                 </div>
-              </div>
-            ))}
+              )
+            })}
             {streaming && (
               <div className="sim-msg">
-                <div className="sim-face">{moodEmoji.thinking}</div>
+                <AvatarFace avatar={config.avatar} mood="thinking" className="sim-face" />
                 <div style={{ maxWidth: '76%' }}>
                   <div className="who">{config.avatar?.name || '小智'} · 正在生成</div>
                   <div className="chat-bubble bot">{stripMeta(streaming)}<span className="blink">▍</span></div>
@@ -161,6 +200,14 @@ export default function ChatPage() {
               </div>
             ))}
           </div>
+
+          {/* 形象表情图状态：验证 5 类图是否齐全 */}
+          {config.avatar && (
+            <div className="voice-detail">
+              <div className="vd-head"><b className="tiny">形象表情图</b><span className="tag">{Object.keys(config.avatar.expressionImages || {}).length}/5 类</span></div>
+              <div className="tiny muted vd-line">缺图的表情自动用内置 emoji 顶替；朗读时按句切换，读完回落 idle。</div>
+            </div>
+          )}
 
           {/* 音色明细：展示来源标记与声学特征，便于验证克隆音色确实被加载 */}
           {config.voice && (

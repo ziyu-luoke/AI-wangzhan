@@ -260,7 +260,7 @@ const SENTENCE_MAX = 42  // 太长的句子再按逗号切，避免单句合成�
 const PREFETCH_MAX = 80  // 客户端预取表上限，防止长会话累积 blob URL
 
 // 把纯文本切成适合逐句合成的句子数组。逐字符扫描，避免依赖 lookbehind 正则的兼容性。
-function splitIntoSentences(text) {
+export function splitIntoSentences(text) {
   const raw = String(text || '').replace(/\s+/g, ' ').trim()
   if (!raw) return []
   const STRONG = '。！？!?；;\n'
@@ -363,6 +363,9 @@ export function stopClonedSpeech() {
   speechRuntime.seq += 1
   const a = speechRuntime.audio
   if (a) { try { a.pause() } catch { /* ignore */ } speechRuntime.audio = null }
+  if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+    try { window.speechSynthesis.cancel() } catch { /* ignore */ }
+  }
   cleanupSpeechUrls()
 }
 
@@ -384,6 +387,8 @@ async function playClonedSequence(text, resource, callbacks = {}) {
     // 播放当前句的同时，后台预合成下一句（并行 = 流水线）
     next = i + 1 < sentences.length ? synthOne(sentences[i + 1], voiceId) : Promise.resolve(null)
     if (!url) { continue } // 某句合成失败则跳过，不中断整轮
+    // 头像随句子切换：在真正开始播放这一句时通知上层（顺序与 sentences 一致）
+    try { callbacks.onSentence?.(sentences[i], i, sentences.length) } catch { /* 回调异常不影响播放 */ }
     const played = await playAudioUrl(url)
     if (mySeq !== speechRuntime.seq) return started
     if (played) started = true
@@ -464,11 +469,11 @@ export const voiceAdapter = {
     }
   },
 
-  speak(text, resource) {
+  speak(text, resource, callbacks = {}) {
     // 真克隆音色：走句子级流水线（首句即播 + 预取下一句），显著降低首字延迟。
     // 这是对整段 speakCloned 的替代；试听单句仍直接用 speakCloned。
     if (resource && resource.ttsMode === 'cloned' && resource.realVoiceId) {
-      playClonedSequence(text, resource)
+      playClonedSequence(text, resource, callbacks)
       return true
     }
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return false
@@ -480,19 +485,47 @@ export const voiceAdapter = {
     // 首次调用常返回空数组（列表异步就绪），若此时直接 synthesize 会退化成系统默认嗓音，
     // 用户会误以为「克隆音色没生效」。这里用 gotVoices 回调在列表就绪后再合成。
     const synthesize = (rawVoices) => {
-      const u = new SpeechSynthesisUtterance(String(text ?? ''))
-      u.rate = Math.min(2, Math.max(0.5, Number(params.speed) || 1))
-      u.pitch = Math.min(2, Math.max(0.5, Number(params.pitch) || 1))
-      u.volume = Math.min(1, Math.max(0, Number(params.volume ?? 1)))
       const picked = pickSystemVoice(rawVoices, gender)
-      if (picked) {
-        u.voice = picked
-        u.lang = picked.lang || 'zh-CN'
-      } else {
-        u.lang = 'zh-CN'
+      const buildUtterance = (sentence) => {
+        const u = new SpeechSynthesisUtterance(String(sentence ?? ''))
+        u.rate = Math.min(2, Math.max(0.5, Number(params.speed) || 1))
+        u.pitch = Math.min(2, Math.max(0.5, Number(params.pitch) || 1))
+        u.volume = Math.min(1, Math.max(0, Number(params.volume ?? 1)))
+        if (picked) {
+          u.voice = picked
+          u.lang = picked.lang || 'zh-CN'
+        } else {
+          u.lang = 'zh-CN'
+        }
+        return u
       }
       synth.cancel()
-      synth.speak(u)
+      // 系统语音也按句子推进：上一句 onend 后才排队下一句，头像切换才与朗读节奏一致。
+      const sentences = splitIntoSentences(text)
+      if (!sentences.length) { try { callbacks.onDone?.() } catch { /* ignore */ }; return }
+      const mySeq = ++speechRuntime.seq // 与克隆语音共用打断计数，新一轮会中止旧的逐句队列
+      let settled = false
+      const speakAt = (i) => {
+        if (mySeq !== speechRuntime.seq) return // 被新一轮打断
+        if (i >= sentences.length) {
+          if (!settled) { settled = true; try { callbacks.onDone?.() } catch { /* ignore */ } }
+          return
+        }
+        const u = buildUtterance(sentences[i])
+        let started = false
+        const fireStart = () => {
+          if (started) return
+          started = true
+          try { callbacks.onSentence?.(sentences[i], i, sentences.length) } catch { /* ignore */ }
+        }
+        u.onstart = fireStart
+        u.onend = () => { fireStart(); speakAt(i + 1) }
+        u.onerror = () => { fireStart(); speakAt(i + 1) }
+        synth.speak(u)
+        // 部分浏览器不触发 onstart，用下一帧兜底，避免头像不切换
+        setTimeout(fireStart, 120)
+      }
+      speakAt(0)
     }
 
     const immediate = synth.getVoices() || []

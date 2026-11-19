@@ -3,6 +3,7 @@
 // 设计目标：配置状态与会话状态分离；配置变更产生带版本号的事件，在会话安全点消费
 
 import { stripMeta } from '../engine/textClean.js'
+import { deleteAvatarExpressions } from '../engine/avatarAssets.js'
 
 const STORAGE_KEY = 'xiaozhi-console-state-v1'
 
@@ -246,12 +247,27 @@ class ConsoleStore {
         this.migrateModelRefs(state)
         this.migrateStripMeta(state)
         this.normalizeVoiceFields(state)
+        this.normalizeAvatarFields(state)
         return state
       }
     } catch (e) {
       console.warn('读取本地状态失败，使用初始数据', e)
     }
-    return seedState()
+    const fresh = seedState()
+    this.normalizeAvatarFields(fresh)
+    return fresh
+  }
+
+  // 归一化形象资源字段（向后兼容）：旧形象没有 expressionImages，补空对象即可，
+  // 对话侧会回退到内置 emoji。缺图/未绑定都不报错。
+  normalizeAvatarFields(state) {
+    for (const a of state.resources?.avatar || []) {
+      if (!a.expressionImages || typeof a.expressionImages !== 'object') a.expressionImages = {}
+      const ex = a.expressions && typeof a.expressions === 'object' ? a.expressions : {}
+      if (!('angry' in ex)) ex.angry = '😠'
+      if (!('idle' in ex)) ex.idle = '🤖'
+      a.expressions = ex
+    }
   }
 
   // 归一化音色资源字段（向后兼容）：
@@ -389,6 +405,13 @@ class ConsoleStore {
       updatedAt: this.now(),
     }
     if (type === 'voice') this.applyVoiceDefaults(item)
+    if (type === 'avatar') {
+      if (!item.expressionImages || typeof item.expressionImages !== 'object') item.expressionImages = {}
+      const ex = item.expressions && typeof item.expressions === 'object' ? item.expressions : {}
+      if (!('angry' in ex)) ex.angry = '😠'
+      if (!('idle' in ex)) ex.idle = '🤖'
+      item.expressions = ex
+    }
     const resources = { ...this.state.resources, [type]: [...this.state.resources[type], item] }
     this.patch({ resources })
     this.audit('新增', `${type}:${item.name}`, 0, 1, `新增${type}资源「${item.name}」`)
@@ -461,6 +484,10 @@ class ConsoleStore {
     // 音色删除后，其原声样本必须同步清理，否则样本库里会留下无主文件
     if (type === 'voice' && current.sampleKey) {
       this.deleteVoiceSample(current.sampleKey)
+    }
+    // 形象删除后同步清理其 5 类表情图，避免资源库残留
+    if (type === 'avatar' && current.expressionImages) {
+      deleteAvatarExpressions(current.expressionImages).catch(() => { /* 清理失败不影响主流程 */ })
     }
     this.audit('删除', `${type}:${current.name}`, 1, 0, `删除「${current.name}」`)
     this.pushEvent('resource', `删除资源「${current.name}」`)

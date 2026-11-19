@@ -115,9 +115,9 @@ export function consumeSafePoint(sessionId) {
 // 传入的 config.voice 就是当前生效绑定指向的音色资源，
 // 其中携带克隆音色派生的 pitch/speed/emotion/gender，
 // speak() 会按 gender 挑选系统语音 —— 这就是「克隆音色真正被加载」的落点。
-export function playTTS(text, config) {
+export function playTTS(text, config, callbacks = {}) {
   if (!config.voice) return false
   const spoken = stripForSpeech(text)
   if (!spoken.trim()) return false
-  return voiceAdapter.speak(spoken, config.voice)
+  return voiceAdapter.speak(spoken, config.voice, callbacks)
 }
