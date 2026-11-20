@@ -7,6 +7,17 @@ import { deleteAvatarExpressions } from '../engine/avatarAssets.js'
 
 const STORAGE_KEY = 'xiaozhi-console-state-v1'
 
+// 人设签名：用于判断"生效人设是否变化"（含内容/语气/问候语/版本）。
+// 会话在安全点切换时比对新旧签名，只有人设真正变了才自动开新对话，
+// 避免仅改模型/音色/形象时也误清空上下文。
+function personaSignature(p) {
+  if (!p) return ''
+  return JSON.stringify([
+    p.id, p.name, p.content, p.greeting, p.fallbackReply,
+    Array.isArray(p.toneTags) ? p.toneTags.join('|') : '', p.version || 0,
+  ])
+}
+
 // ---------- 样本库（声音原声留存） ----------
 // 为什么要单独存：克隆音色的「原声」必须留档，否则无法试听原素材、
 // 也没法在替换音色时对比新旧差异。
@@ -226,8 +237,12 @@ function seedState() {
       sessionId: 'sess-demo-001', deviceId: '72f0d5bf-f30e-4c87-95c7-d17c794a65a4',
       identity: { userName: '小主人' }, topic: '周末去哪里玩',
       configVersion: 0, status: 'active', pendingSwitch: false,
+      // 本会话上下文是基于哪个人设生成的快照（安全点切换时据此判断是否要自动开新对话）
+      personaSig: personaSignature(
+        seedResources().persona.find((p) => p.id === 'persona-sweet')
+      ),
       context: [
-        { role: 'system', content: '（身份由当前生效的虚拟形象动态决定）', configVersion: 0, dynamic: true },
+        { role: 'system', content: '（身份由当前生效的 AI 人设动态决定）', configVersion: 0, dynamic: true },
         { role: 'user', content: '周末我们去哪里玩呀？', configVersion: 0 },
         { role: 'assistant', content: '可以去公园野餐呀，天气据说很不错呢～', configVersion: 0 },
       ],
@@ -260,6 +275,7 @@ class ConsoleStore {
         this.migrateStripMeta(state)
         this.normalizeVoiceFields(state)
         this.normalizeAvatarFields(state)
+        this.normalizeSessionPersonaSig(state)
         return state
       }
     } catch (e) {
@@ -267,7 +283,19 @@ class ConsoleStore {
     }
     const fresh = seedState()
     this.normalizeAvatarFields(fresh)
+    this.normalizeSessionPersonaSig(fresh)
     return fresh
+  }
+
+  // 归一化会话人设签名（向后兼容）：老数据缺 personaSig 时，按当前生效人设补一份基线，
+  // 避免升级后第一次发布被误判成"人设变化"而清空上下文。
+  normalizeSessionPersonaSig(state) {
+    const binding = state.publishedBinding || state.draftBinding
+    const p = (state.resources?.persona || []).find((x) => x.id === binding?.personaId)
+    const sig = personaSignature(p)
+    for (const s of state.sessions || []) {
+      if (s.personaSig === undefined || s.personaSig === null) s.personaSig = sig
+    }
   }
 
   // 归一化形象资源字段（向后兼容）：
@@ -619,13 +647,27 @@ class ConsoleStore {
     if (!s || !s.pendingSwitch) return null
     const target = s.targetVersion
     const binding = this.state.publishedBinding
-    // 上下文迁移：保留会话身份/话题/历史消息，仅标记新版本，历史不重写（避免上下文污染）
-    const movedContext = s.context.map((m) => ({ ...m }))
+    // 生效人设变了 → 旧上下文是按旧人设生成的，留着会把新人设带偏。
+    // 此时清空上下文、以新人设 greeting 打头开一轮新对话（"改人设自动新对话"）。
+    const newPersona = this.getResource('persona', binding?.personaId)
+    const newSig = personaSignature(newPersona)
+    const personaChanged = newSig !== (s.personaSig || '')
+    const greeting = String(newPersona?.greeting || '').trim()
+
+    let movedContext
+    if (personaChanged) {
+      movedContext = [{ role: 'system', content: '（身份由当前生效的 AI 人设动态决定）', configVersion: target, dynamic: true }]
+      if (greeting) movedContext.push({ role: 'assistant', content: greeting, configVersion: target, time: this.now() })
+    } else {
+      // 人设没变：保留会话身份/话题/历史消息，仅标记新版本，历史不重写（避免上下文污染）
+      movedContext = s.context.map((m) => ({ ...m }))
+    }
     const switchRecord = {
       fromVersion: s.configVersion, toVersion: target,
       time: this.now(),
       changes: this.describeBindingChanges(binding),
       messageCount: movedContext.length,
+      personaChanged,
     }
     const updated = {
       ...s,
@@ -633,13 +675,43 @@ class ConsoleStore {
       pendingSwitch: false,
       targetVersion: undefined,
       context: movedContext,
+      personaSig: newSig,
       switchHistory: [switchRecord, ...s.switchHistory],
       updatedAt: this.now(),
     }
     const sessions = this.state.sessions.map((x) => x.sessionId === sessionId ? updated : x)
     this.patch({ sessions })
-    this.audit('切换', `会话 ${sessionId}`, s.configVersion, target, `安全点热切换，保留 ${movedContext.length} 条上下文`)
-    this.pushEvent('switch', `会话已在安全点切换到 v${target}，上下文完整保留`, 'success')
+    if (personaChanged) {
+      this.audit('切换', `会话 ${sessionId}`, s.configVersion, target, `人设已更新，开启新对话并发送问候语`)
+      this.pushEvent('switch', `已在安全点切换到 v${target}；人设变化，已开启新对话`, 'success')
+    } else {
+      this.audit('切换', `会话 ${sessionId}`, s.configVersion, target, `安全点热切换，保留 ${movedContext.length} 条上下文`)
+      this.pushEvent('switch', `会话已在安全点切换到 v${target}，上下文完整保留`, 'success')
+    }
+    return updated
+  }
+
+  // 新对话：原地清空当前会话消息（同一 sessionId，不新建），用当前人设 greeting 打头。
+  // "无需保存上一次对话"——不弹保存提示，直接覆盖 context。
+  resetSession(sessionId, persona) {
+    const s = this.state.sessions.find((x) => x.sessionId === sessionId)
+    if (!s) return null
+    const greeting = String(persona?.greeting || '').trim()
+    const ctx = [{ role: 'system', content: '（身份由当前生效的 AI 人设动态决定）', configVersion: s.configVersion, dynamic: true }]
+    if (greeting) ctx.push({ role: 'assistant', content: greeting, configVersion: s.configVersion, time: this.now() })
+    const updated = {
+      ...s,
+      context: ctx,
+      personaSig: personaSignature(persona),
+      topic: '新对话',
+      pendingSwitch: false,
+      targetVersion: undefined,
+      updatedAt: this.now(),
+    }
+    const sessions = this.state.sessions.map((x) => x.sessionId === sessionId ? updated : x)
+    this.patch({ sessions })
+    this.audit('新对话', `会话 ${sessionId}`, s.configVersion, s.configVersion, '清空上下文，原地开启新对话')
+    this.pushEvent('new-chat', '已开启新对话', 'info')
     return updated
   }
 

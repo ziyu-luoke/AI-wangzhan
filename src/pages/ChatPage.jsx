@@ -25,17 +25,42 @@ export default function ChatPage() {
   const [busy, setBusy] = useState(false)
   const [botMood, setBotMood] = useState('idle')
   const [activeMsgMood, setActiveMsgMood] = useState(null) // 正在朗读的那条助手消息的气质（按句变化）
-  const msgsEndRef = useRef(null)
+  const pageRef = useRef(null)      // 对话页根节点：整页滚动目标，滚到这里可同时看到消息框与输入区
+  const msgsBoxRef = useRef(null)   // 消息列表容器：只滚动它自身，避免牵动整页
   const timersRef = useRef([])
 
+  // 消息区内部跟随最新内容（含流式输出）：只滚动内部容器，不触发整页滚动。
+  // 旧实现把"消息末尾"scrollIntoView 默认 block:'start' 顶到视口顶部，
+  // 导致下方输入区被挤出视野、侧栏露出（错误位置）。
   useEffect(() => {
-    msgsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const box = msgsBoxRef.current
+    if (box) box.scrollTop = box.scrollHeight
   }, [session.context.length, streaming])
+
+  // 整页滚动：仅在进入对话页（从其他界面返回）与消息数变化（发送/新对话/人设切换）时，
+  // 把对话页顶部对齐到视口，确保对话框与输入区完整可见；
+  // streaming 变化不触发，避免流式输出过程反复把页面拉回顶部、影响正常浏览。
+  useEffect(() => {
+    pageRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [session.context.length])
 
   useEffect(() => () => {
     timersRef.current.forEach(clearTimeout)
     stopClonedSpeech()
   }, [])
+
+  // 新对话：原地清空当前会话消息，用当前生效人设的 greeting 自动打头；不弹保存提示
+  const newChat = () => {
+    stopClonedSpeech()
+    timersRef.current.forEach(clearTimeout)
+    timersRef.current = []
+    store.resetSession(session.sessionId, config.persona)
+    setInput(''); setStreaming(''); setBusy(false)
+    setBotMood('idle'); setActiveMsgMood(null)
+    setMascot('happy', '开启新对话啦～')
+    const g = String(config.persona?.greeting || '').trim()
+    toast(g ? `已开启新对话，并以人设「${config.persona?.name || '默认'}」向你问好` : '已开启新对话', 'success')
+  }
 
   const send = async (text) => {
     const msg = (text || input).trim()
@@ -101,9 +126,17 @@ export default function ChatPage() {
     const t = setTimeout(() => {
       const switched = consumeSafePoint(session.sessionId)
       if (switched) {
-        const changes = switched.switchHistory[0]?.changes?.join('，') || ''
-        toast(`✅ 已在安全点切换到 v${switched.configVersion}，会话与 ${switched.context.length} 条上下文完整保留`, 'success')
-        setMascot('surprised', `切换到 v${switched.configVersion} 啦！`, 3200)
+        const rec = switched.switchHistory[0] || {}
+        const changes = (rec.changes || []).join('，')
+        if (rec.personaChanged) {
+          // 人设变了：store 已清空上下文并以新 greeting 开新对话，这里只做 UI 复位与提示
+          setStreaming(''); setBotMood('idle'); setActiveMsgMood(null)
+          toast(`✅ 已切换到 v${switched.configVersion}；人设变更，已开启新对话`, 'success')
+          setMascot('surprised', '换人设啦，重新认识一下！', 3200)
+        } else {
+          toast(`✅ 已在安全点切换到 v${switched.configVersion}，会话与 ${switched.context.length} 条上下文完整保留`, 'success')
+          setMascot('surprised', `切换到 v${switched.configVersion} 啦！`, 3200)
+        }
         setBotMood('surprised')
         const tReset = setTimeout(() => setBotMood('idle'), 1400)
         timersRef.current.push(tReset)
@@ -124,7 +157,7 @@ export default function ChatPage() {
   })()
 
   return (
-    <div>
+    <div ref={pageRef}>
       <div className="page-head">
         <div>
           <h2>💬 对话演示</h2>
@@ -132,6 +165,7 @@ export default function ChatPage() {
         </div>
         <span className="spacer" />
         {session.pendingSwitch && <span className="badge warn">⏳ 有配置待切换 · 本轮结束后生效</span>}
+        <button className="btn btn-sm btn-blue" onClick={newChat} disabled={busy}>🆕 新对话</button>
       </div>
 
       <div className="chat-sim">
@@ -149,7 +183,7 @@ export default function ChatPage() {
             <span className="badge" style={{ background: '#fff' }}>v{session.configVersion}</span>
           </div>
 
-          <div className="sim-msgs">
+          <div className="sim-msgs" ref={msgsBoxRef}>
             {visible.map((m, i) => {
               const isAssistant = m.role === 'assistant'
               const isSpeaking = isAssistant && i === lastAssistantIdx && !!activeMsgMood
@@ -175,7 +209,6 @@ export default function ChatPage() {
                 </div>
               </div>
             )}
-            <div ref={msgsEndRef} />
           </div>
 
           <div className="sim-input-bar">
@@ -196,7 +229,7 @@ export default function ChatPage() {
               ['🧠', 'AI 模型', config.model?.name],
               ['🎨', '虚拟形象', config.avatar?.name],
               ['🎵', '语音音色', config.voice?.name],
-              ['💖', 'AI 人设', config.avatar?.persona?.content ? '形象专属' : (config.persona?.name || '全局人设')],
+              ['💖', 'AI 人设', config.persona?.name || '未绑定'],
             ].map(([emoji, type, name]) => (
               <div className="active-item" key={type}>
                 <span className="a-emoji">{emoji}</span>
@@ -205,13 +238,13 @@ export default function ChatPage() {
             ))}
           </div>
 
-          {/* 当前 AI 身份：直接展示本轮对话使用的身份/语气/背景，便于验证切换即时生效且不串扰 */}
+          {/* 名字来自形象、身份来自 AI 人设：两者分离，便于验证切换即时生效且不串扰 */}
           <div className="voice-detail">
-            <div className="vd-head"><b className="tiny">🪪 当前 AI 身份</b><span className="tag tag-on">{aiName}</span></div>
-            <div className="tiny muted vd-line">对话中以此名称自称；切到别的形象并经发布中心生效后，下一轮立即换成对应身份。</div>
+            <div className="vd-head"><b className="tiny">🪪 名字与身份</b><span className="tag tag-on">{aiName}</span></div>
+            <div className="tiny muted vd-line">名字（形象名，问"你是谁"时回答）：<b>{identity.name}</b></div>
+            <div className="tiny muted vd-line">身份标识（人设名，仅问"你的身份"时回答）：<b>{identity.identityName || '未设置'}</b></div>
             <div className="tiny muted vd-line">语气：<b>{identity.tags.join('、') || '默认'}</b></div>
-            {(config.avatar?.persona?.background) && <div className="tiny muted vd-line">背景：{config.avatar.persona.background}</div>}
-            {!config.avatar?.persona?.content && <div className="tiny muted vd-line">该形象无专属人设，回退到全局人设「{config.persona?.name || '默认'}」。</div>}
+            {identity.content && <div className="tiny muted vd-line">回复规则摘要：{String(identity.content).slice(0, 46)}{String(identity.content).length > 46 ? '…' : ''}</div>}
           </div>
 
           {/* 形象表情图状态：验证 5 类图是否齐全 */}
